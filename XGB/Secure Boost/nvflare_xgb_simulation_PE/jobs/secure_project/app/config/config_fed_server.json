@@ -1,0 +1,44 @@
+{
+  "format_version": 2,
+  "num_rounds": 50,
+  "custom_folder": "custom",
+
+  "components": [
+    {
+      "id": "server_evaluator",
+      "path": "server_eval.XGBoostValidator",
+      "args": {
+        "test_data_path": "/home/sudhir/nvflare_xgb_simulation/test_processed.csv",
+        "label_col": "Access"
+      }
+    }
+  ],
+
+  "workflows": [
+    {
+      "id": "xgb_controller",
+      "path": "custom_xgb_controller.CustomXGBController",
+      "args": {
+        "num_rounds": "{num_rounds}",
+        "data_split_mode": 0,
+        "secure_training": false,
+        "xgb_params": {
+	  "eta": 0.3,
+          "max-depth": 6,	  
+          "subsample": 1.0,         
+          "objective": "binary:logistic",
+          "eval_metric": "auc",
+          "tree_method": "hist",
+          "nthread": 1,
+          "verbosity": 2
+        },
+        "client_ranks": {
+          "site-1": 0,
+          "site-2": 1,
+          "site-3": 2,
+          "site-4": 3
+        }
+      }
+    }
+  ]
+}

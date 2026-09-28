@@ -1,0 +1,46 @@
+bash# Step 1: Train all 12 cases (SBC/PBP/RNP × ARFE/AVC/ARFE_AVC/NaiveNA)
+python3.10 run_simulation.py --datasets company \
+    --strategies SBC,PBP,RNP --prep-types 2,3,4,5 --seeds 0
+
+# Step 2: Start XGB PE server for one case
+python3.10 policyEnforcement_withPrivacy_AES256_XGB_Company.py \
+    --algo SBC --prep-type 2 --seed 0
+
+# Step 3: Run test
+python3.10 auto_test_runner_XGB_Company.py \
+    --algo SBC --prep-type 2 --seed 0 --all-nodes
+
+# Consolidate all 12 PE results
+python3.10 auto_test_runner_XGB_Company.py --consolidate
+# → Results/XGB/Company/consolidated_results.csv
+
+
+
+source ~/Project/nvflare_xgb_simulation_PE/nvflare_env/bin/activate
+cd ~/Project/nvflare_xgb_simulation_PE
+python run_simulation.py --datasets company --strategies SBC,PBP,RNP --prep-types 2,3,4,5 --seeds 0
+
+
+# Step 1: Train all 12 cases (SBC/PBP/RNP × ARFE/AVC/ARFE_AVC/NaiveNA)
+python3.10 run_simulation.py --datasets company \
+    --strategies SBC,PBP,RNP --prep-types 2,3,4,5 --seeds 0
+
+# Step 2: Start XGB PE server for one case
+python3.10 policyEnforcement_withPrivacy_AES256_XGB_Company.py \
+    --algo SBC --prep-type 2 --seed 0
+
+# Step 3: Run test
+python3.10 auto_test_runner_XGB_Company.py \
+    --algo SBC --prep-type 2 --seed 0 --all-nodes
+
+# Consolidate all 12 PE results
+python3.10 auto_test_runner_XGB_Company.py --consolidate
+# → Results/XGB/Company/consolidated_results.csv
+
+
+# Re-run simulation (regenerates raw_test_data_{seed}.csv)
+python run_simulation.py --datasets company --strategies SBC,PBP,RNP --prep-types 2,3,4,5 --seeds 0
+
+# Then test PE
+python policyEnforcement_withPrivacy_AES256_XGB_Company.py --algo SBC --prep-type 2 --seed 0
+python auto_test_runner_XGB_Company.py --algo SBC --prep-type 2 --seed 0 --all-nodes

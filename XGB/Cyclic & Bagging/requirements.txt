@@ -1,0 +1,24 @@
+# requirements.txt  –  Federated XGBoost Policy Mining (Bagging / Cyclic, AES-256-GCM)
+#
+# Install (inside the virtual environment):
+#     pip install -r requirements.txt
+#
+# Python 3.10 – 3.12 supported.
+# Versions below are the ones the code was tested against.  Upper bounds are
+# set only where a newer major version is known to break the code
+# (flwr 2.x removed flwr.common.context; pandas < 2.2 lacks StringDtype support
+# used in utils._is_string_col).
+
+# ── Federated learning framework (server / client / simulation) ──────────────
+flwr[simulation]>=1.9.0,<2.0        # tested: 1.29.0 — pulls in ray automatically
+ray>=2.10.0                         # simulation backend used by simulate_one.py
+
+# ── Model & data science ─────────────────────────────────────────────────────
+xgboost>=2.0.0                      # tested: 3.4.1
+scikit-learn>=1.3.0                 # tested: 1.8.0  (SelectKBest, metrics, train_test_split)
+pandas>=2.2.0                       # tested: 3.0.2
+numpy>=1.24.0                       # tested: 2.4.4
+torch>=2.0.0                        # tensors used in utils.partition_dataset (CPU build is enough)
+
+# ── Encryption (encryption.py: AES-256-GCM + HKDF-SHA256) ────────────────────
+cryptography>=41.0.0                # tested: 46.0.7

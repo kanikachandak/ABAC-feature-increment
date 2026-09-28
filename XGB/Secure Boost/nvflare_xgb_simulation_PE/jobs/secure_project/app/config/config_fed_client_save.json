@@ -1,0 +1,25 @@
+{
+  "format_version": 2,
+  "executors": [
+    {
+      "tasks": ["config", "start"],
+      "executor": {
+        "id": "Executor",
+        "path": "nvflare.app_opt.xgboost.histogram_based_v2.fed_executor.FedXGBHistogramExecutor",
+        "args": {
+          "data_loader_id": "dataloader"
+        }
+      }
+    }
+  ],
+  "components": [
+    {
+      "id": "dataloader",
+      "path": "nvflare.app_opt.xgboost.histogram_based_v2.csv_data_loader.CSVDataLoader",
+      "args": {
+        "folder": "/home/sudhir/nvflare_xgb_simulation/data/"
+      }
+    }
+  ]
+}
+

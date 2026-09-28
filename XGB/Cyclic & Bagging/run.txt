@@ -1,0 +1,57 @@
+cd "/home/sudhir/Project/1_Policy_Mining/Distributed/XGB/Cyclic & Bagging/xgb1"
+source xgb_env/bin/activate
+rm -f results/consolidated_results.csv   # clear old 3600-row file
+
+python run_simulation.py \
+  --datasets company,university1,university2 \
+  --strategies sbp,pbp,rnp \
+  --prep-types 2,3,4,5 \
+  --train-methods bagging,cyclic \
+  --seeds 0 --num-rounds 50
+
+
+  Client                              Server
+  │                                    │
+  │ fit() round 1:                     │
+  │   train bst locally               │
+  │   encrypt(bst bytes) ─────────────▶ EncryptedFedXgbBagging.aggregate_fit()
+  │                                    │   decrypt each client tensor
+  │                                    │   aggregate() raw bytes (merge trees)
+  │                                    │   evaluate on decrypted model
+  │                                    │   re-encrypt aggregated model
+  │ fit() round 2+:                    │
+  │   decrypt(ins.tensors[0]) ◀─────── │   send encrypted global model
+  │   load_model(decrypted)           │
+  │   local_boost()                   │
+  │   encrypt(bst bytes) ─────────────▶ (repeat)
+  │                                    │
+  │ evaluate():                        │
+  │   decrypt(ins.tensors[0]) ◀─────── │
+  │   load_model(decrypted)           │
+
+
+  Run with encryption:
+
+  source xgb_env/bin/activate
+cd "/home/sudhir/Project/1_Policy_Mining/Distributed/XGB/Cyclic & Bagging/xgb1"
+
+# Copy encryption.py into your project folder first
+
+rm -f results/consolidated_results.csv
+
+# Set your shared secret (same value on all machines in distributed mode)
+python run_simulation.py \
+  --datasets company,university1,university2 \
+  --strategies sbp,pbp,rnp \
+  --prep-types 2,3,4,5 \
+  --train-methods bagging,cyclic \
+  --seeds 0 \
+  --shared-secret "my-secure-secret-2024"
+
+  For multi-machine distributed mode, set the same env var on every machine before starting:
+
+  export FL_SHARED_SECRET="my-secure-secret-2024"
+./start_server.sh
+# on each client machine:
+./start_client.sh
+

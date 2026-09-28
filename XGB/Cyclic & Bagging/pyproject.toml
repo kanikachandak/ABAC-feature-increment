@@ -1,0 +1,71 @@
+# pyproject.toml  –  Flower federation configuration
+# Supports both local simulation and true multi-machine distributed mode.
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name        = "fl-policy-mining"
+version     = "1.0.0"
+description = "Federated ABAC Policy Mining with XGBoost"
+requires-python = ">=3.10"
+dependencies = [
+    "flwr[simulation]>=1.9.0,<2.0",
+    "xgboost>=2.0.0",
+    "scikit-learn>=1.3.0",
+    "torch>=2.0.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+]
+
+# ─── Flower app ──────────────────────────────────────────────────────────────
+[tool.flwr.app]
+publisher = "research"
+
+[tool.flwr.app.components]
+serverapp = "server:app"
+clientapp = "client:app"
+
+# ─── Default run config (overridable via env-vars in run_simulation.py) ───────
+[tool.flwr.app.config]
+num-server-rounds           = 50      # global FL rounds
+fraction-fit                = 1.0     # use all available clients each round
+train-method                = "bagging"  # "bagging" | "cyclic"
+centralised-eval            = true    # evaluate on server-side held-out test set
+local-epochs                = 3       # XGBoost boosting rounds per FL round
+scaled-lr                   = false   # divide eta by num_clients if true
+dataset-name                = "company"
+DataSet-Partition-Type      = 2       # 2=ARFE 3=AVC 4=ARFE+AVC 5=NaiveNA
+
+# XGBoost hyperparameters
+# NOTE: scale-pos-weight is computed dynamically per dataset in client.py/server.py
+#       based on the actual class ratio; the value below is a safe placeholder.
+[tool.flwr.app.config.params]
+objective         = "binary:logistic"
+eta               = 0.05          # learning rate  (lower = more stable)
+max-depth         = 6
+min-child-weight  = 5             # regularisation — prevents tiny leaves
+subsample         = 0.8           # row sampling per tree
+colsample-bytree  = 0.8           # feature sampling per tree
+gamma             = 0.1           # min gain to split a leaf
+eval-metric       = "auc"         # optimise AUC (better for imbalanced data)
+nthread           = 1             # 1 thread per client process
+tree-method       = "hist"        # fast histogram method
+seed              = 0
+scale-pos-weight  = 1             # placeholder — overridden at runtime
+
+
+# ─── Federation: local simulation (4 clients, same machine) ──────────────────
+[tool.flwr.federations.local-simulation]
+options.num-supernodes = 4
+options.backend.client-resources.num-cpus = 2
+options.backend.client-resources.num-gpus = 0.0
+
+# ─── Federation: distributed (clients on separate machines) ──────────────────
+# Server machine  : flower-server-app server:app --address 0.0.0.0:9092
+# Each client node: flower-supernode --superlink <SERVER_IP>:9092 \
+#                       --clientappio-api-address 0.0.0.0:9094
+[tool.flwr.federations.distributed]
+address  = "0.0.0.0:9092"
+insecure = true
