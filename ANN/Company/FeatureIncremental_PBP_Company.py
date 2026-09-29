@@ -44,6 +44,13 @@ Artefacts saved
   Model/PBP/<prep_name>/ArtificialNeuralNetwork_final.pth
   Results/Company/PBP/<prep_name>/Seed_0/results.csv
   consolidated_results.csv   ← 12-case summary across all algos/prep_types
+
+Changes from baseline
+─────────────────────
+ - Added old/current feature-set data loading, preprocessing, and PBP partitioning.
+ - Added separate old/current ANN models and parameter initialization for the new feature.
+ - Added per-sample weights with balancing, normalization, and model regularization.
+ - Added alternating optimization of old/current models and sample weights with FedAvg.
 """
 
 import argparse
@@ -384,41 +391,65 @@ def calculating_balancing_regulariser(X, u):
 
     X: [n_samples, n_features]
     u: [n_samples]
+
+    For each feature X_j and each distinct category k:
+        treatment = I(X_j == k)
+        control   = I(X_j != k)
+
+    This generalizes the paper's binary treatment/control formulation
+    to categorical features while keeping the same weighted
+    first-order moment balancing objective.
+
+    Every distinct encoded value is treated as a valid category,
+    including -1 (NotA).
     """
 
     n_samples, n_features = X.shape
 
     total_bal = torch.tensor(0.0, device=X.device, dtype=X.dtype)
 
-    ones = torch.ones(n_samples, device=X.device, dtype=X.dtype)
+    eps = 1e-8 # avoid div by 0
 
     for j in range(n_features):
         # Treatment feature X_j
         X_j = X[:, j]
 
+        categories = torch.unique(X_j)
         # remaining features X_(-j)
         remaining_mask = torch.ones(n_features, device=X.device, dtype=torch.bool)
         remaining_mask[j] = False
-
         X_remaining = X[:, remaining_mask]
 
-        # weighted treatment/control denominators
-        # T_j = u ⊙ X_j / u^T X_j
-        # C_j = u ⊙ (1 - X_j) / u^T (1 - X_j)
+        for category in categories:
+            # Binary treatment indicator for this category.
+            treatment = (X_j == category).to(X.dtype)
 
-        T_wt = u @ X_j
-        C_wt = u @ (ones - X_j)
-        eps = 1e-8 # avoid div by 0
+            # Everything not belonging to this category is control.
+            control = (X_j != category).to(X.dtype)
 
-        T_j = u * X_j / (T_wt + eps)
-        C_j = u * (ones - X_j) / (C_wt + eps)
+            # Weighted sizes of treatment and control groups.            
+            T_wt = torch.sum(u * treatment)
+            C_wt = torch.sum(u * control)
 
-        # weighted first-order moment difference
-        T_M = X_remaining.T @ T_j
-        C_M = X_remaining.T @ C_j
-        M_diff = T_M - C_M
+            # Skip if one of the groups has zero weighted mass.
+            if T_wt <= eps or C_wt <= eps:
+                continue
 
-        total_bal += torch.sum(M_diff ** 2)
+            # Normalized weighted treatment/control sample weights.
+            # T_j = u ⊙ X_j / u^T X_j
+            # C_j = u ⊙ (1 - X_j) / u^T (1 - X_j)
+            T_j = u * treatment / (T_wt + eps)
+            C_j = u * control / (C_wt + eps)
+
+            # Weighted first-order moments of all remaining features.
+            T_M = X_remaining.T @ T_j
+            C_M = X_remaining.T @ C_j
+
+            # Difference in treatment/control moments.
+            M_diff = T_M - C_M
+
+            # Same squared moment-difference objective.
+            total_bal += torch.sum(M_diff ** 2)
 
     return total_bal
 
@@ -691,36 +722,74 @@ def aggregate_metrics(current_folder_path):
 
 def run_federated_multithread(
     rank, world_size, model_class,
-    X_train, X_test, y_train, y_test,
-    X_clients, y_clients, yes_no_counts,
-    partition_details,
+
+    # Old feature set
+    X_prev_train, X_prev_test, y_prev_train, y_prev_test,
+    X_prev_clients, y_prev_clients,
+    prev_yes_no_counts, prev_partition_details,
+
+    # Current feature set
+    X_curr_train, X_curr_test, y_curr_train, y_curr_test,
+    X_curr_clients, y_curr_clients,
+    curr_yes_no_counts, curr_partition_details,
+
     results_dir, model_path, time_file, log_file,
     base_dir, prep_name,
 ):
     setup_multithread(rank, world_size)
     device = torch.device("cpu")
-    prev_model = model_class(X_train.shape[1]).to(device)
-    curr_model = model_class(X_train.shape[1] + 1).to(device)
+    # models
+    prev_model = model_class(X_prev_train.shape[1]).to(device)
+    curr_model = model_class(X_curr_train.shape[1]).to(device)
 
-    # prev_loaders = get_data_loaders(
-    #     X_prev_clients,
-    #     y_prev_clients
-    # )
+    with torch.no_grad():
+        # copy old model weights into new model only for old features
+        curr_model.fc1.weight[:, :-1].copy_(prev_model.fc1.weight)
 
-    # curr_loaders = get_data_loaders(
-    #     X_curr_clients,
-    #     y_curr_clients
-    # )
+        # everything after 1st layer is unchanged by new input feature
+        curr_model.fc1.bias.copy_(prev_model.fc1.bias)
+        curr_model.fc2.weight.copy_(prev_model.fc2.weight)
+        curr_model.fc2.bias.copy_(prev_model.fc2.bias)
+
+    # data loaders
+    prev_loaders = get_data_loaders(X_prev_clients, y_prev_clients)
+    curr_loaders = get_data_loaders(X_curr_clients, y_curr_clients)
 
     if rank == 0:
-        test_loader = DataLoader(TensorDataset(X_test, y_test),
-                                 batch_size=32, shuffle=False)
-        test_ync = ((y_test == 1).sum().item(), (y_test == 0).sum().item())
+        prev_test_loader = DataLoader(
+            TensorDataset(X_prev_test, y_prev_test),
+            batch_size=32,
+            shuffle=False
+        )
+
+        curr_test_loader = DataLoader(
+            TensorDataset(X_curr_test, y_curr_test),
+            batch_size=32,
+            shuffle=False
+        )
+
+        prev_test_ync = (
+            (y_prev_test == 1).sum().item(),
+            (y_prev_test == 0).sum().item()
+        )
+
+        curr_test_ync = (
+            (y_curr_test == 1).sum().item(),
+            (y_curr_test == 0).sum().item()
+        )
+        
         log_initial_details(
-            model_class.__name__, world_size, X_clients,
-            len(X_train), len(X_test),
-            yes_no_counts, test_ync,
-            partition_details, log_file,
+            model_class.__name__, world_size, X_prev_clients,
+            len(X_prev_train), len(X_prev_test),
+            prev_yes_no_counts, prev_test_ync,
+            prev_partition_details, log_file,
+        )
+
+        log_initial_details(
+            model_class.__name__, world_size, X_curr_clients,
+            len(X_curr_train), len(X_curr_test),
+            curr_yes_no_counts, curr_test_ync,
+            curr_partition_details, log_file,
         )
 
     fed_rounds  = 50
@@ -731,32 +800,42 @@ def run_federated_multithread(
     for r in range(fed_rounds):
         if rank == 0:
             print(f"[MT] Round {r+1}/{fed_rounds}")
-        train_time = train_local(rank, model, data_loaders[rank], device)
-        aggregate_multithread(model, world_size)
-        end = time.time()
+
+        train_time = train_local(rank, prev_model, prev_loaders[rank], curr_model, curr_loaders[rank], device)
+        aggregate_multithread(prev_model, world_size)
+        aggregate_multithread(curr_model, world_size)
+
+        # --------------------------------------------------------
+        # Evaluate the CURRENT feature-set model
+        #
+        # This is the model that has access to the newly added
+        # feature and is therefore the final feature-incremental
+        # model.
+        # --------------------------------------------------------
         if rank == 0:
-            acc, prec, rec, f1, inf_t = evaluate(model, test_loader, device)
+            acc, prec, rec, f1, inf_t = evaluate(curr_model, curr_test_loader, device)
             total_inf_t.extend(inf_t)
             save_round_result(model_class.__name__, acc, prec, rec, f1, results_dir)
             with open(log_file, "a") as lf:
                 lf.write(f"Round {r+1}  TrainTime={train_time:.4f}s  "
                          f"AvgInference={np.mean(inf_t):.10f}s\n")
 
-    total_train_time = end - start
+    total_train_time = time.time() - start
     save_training_time(model_class.__name__, rank, total_train_time, time_file)
 
+    # Save final CURRENT model
     if rank == 0:
         os.makedirs(model_path, exist_ok=True)
-        save_path = os.path.join(model_path, f"{model_class.__name__}_final.pth")
-        torch.save(model.state_dict(), save_path)
-        print(f"[INFO] Model saved → {save_path}")
+        save_path = os.path.join(model_path, f"{model_class.__name__}_feat_incr_final.pth")
+        torch.save(curr_model.state_dict(), save_path)
+        print(f"[INFO] Feat. Incr. Model saved → {save_path}")
 
         avg_inf_ms = np.mean(total_inf_t) * 1000 if total_inf_t else 0.0
         save_consolidated_result(
             base_dir, ALGO, prep_name, model_class.__name__,
             acc, prec, rec, f1,
             total_train_time, avg_inf_ms,
-            int(len(X_train)), int(len(X_test)),
+            int(len(X_curr_train)), int(len(X_curr_test)),
         )
 
     cleanup()
@@ -849,9 +928,16 @@ def main(prep_type):
                 run_federated_multithread,
                 args=(
                     world_size, model_cls,
-                    X_train_t, X_test_t, y_train_t, y_test_t,
-                    X_clients, y_clients, yes_no_counts,
-                    partition_details,
+
+                    # Old feature set
+                    X_prev_train_t, X_prev_test_t, y_prev_train_t, y_prev_test_t,
+                    X_prev_clients, y_prev_clients, prev_yes_no_counts,
+                    prev_partition_details,
+                    # New feature set
+                    X_curr_train_t, X_curr_test_t, y_curr_train_t, y_curr_test_t,
+                    X_curr_clients, y_curr_clients, curr_yes_no_counts,
+                    curr_partition_details,
+
                     results_dir, model_path, time_file, log_file,
                     base_dir, prep_name,
                 ),
@@ -865,7 +951,7 @@ def main(prep_type):
 # ═══════════════════════════════════════════════════════════════════════════════
 #  PREP  mode
 # ═══════════════════════════════════════════════════════════════════════════════
-
+### Unmodified for now
 def run_prep(prep_type):
     """Prepare and persist encoded tensors for multimachine training."""
     prep_names = {2: "ARFE", 3: "AVC", 4: "ARFE_AVC", 5: "NaiveNA"}
@@ -914,7 +1000,7 @@ def run_prep(prep_type):
 # ═══════════════════════════════════════════════════════════════════════════════
 #  MULTIMACHINE  mode
 # ═══════════════════════════════════════════════════════════════════════════════
-
+### Unmodified for now
 def run_federated_multimachine(rank, world_size, prep_type, prep_name,
                                master_addr, master_port, base_dir):
     """
