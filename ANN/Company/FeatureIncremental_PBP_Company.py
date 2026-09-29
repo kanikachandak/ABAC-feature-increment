@@ -391,41 +391,65 @@ def calculating_balancing_regulariser(X, u):
 
     X: [n_samples, n_features]
     u: [n_samples]
+
+    For each feature X_j and each distinct category k:
+        treatment = I(X_j == k)
+        control   = I(X_j != k)
+
+    This generalizes the paper's binary treatment/control formulation
+    to categorical features while keeping the same weighted
+    first-order moment balancing objective.
+
+    Every distinct encoded value is treated as a valid category,
+    including -1 (NotA).
     """
 
     n_samples, n_features = X.shape
 
     total_bal = torch.tensor(0.0, device=X.device, dtype=X.dtype)
 
-    ones = torch.ones(n_samples, device=X.device, dtype=X.dtype)
+    eps = 1e-8 # avoid div by 0
 
     for j in range(n_features):
         # Treatment feature X_j
         X_j = X[:, j]
 
+        categories = torch.unique(X_j)
         # remaining features X_(-j)
         remaining_mask = torch.ones(n_features, device=X.device, dtype=torch.bool)
         remaining_mask[j] = False
-
         X_remaining = X[:, remaining_mask]
 
-        # weighted treatment/control denominators
-        # T_j = u ⊙ X_j / u^T X_j
-        # C_j = u ⊙ (1 - X_j) / u^T (1 - X_j)
+        for category in categories:
+            # Binary treatment indicator for this category.
+            treatment = (X_j == category).to(X.dtype)
 
-        T_wt = u @ X_j
-        C_wt = u @ (ones - X_j)
-        eps = 1e-8 # avoid div by 0
+            # Everything not belonging to this category is control.
+            control = (X_j != category).to(X.dtype)
 
-        T_j = u * X_j / (T_wt + eps)
-        C_j = u * (ones - X_j) / (C_wt + eps)
+            # Weighted sizes of treatment and control groups.            
+            T_wt = torch.sum(u * treatment)
+            C_wt = torch.sum(u * control)
 
-        # weighted first-order moment difference
-        T_M = X_remaining.T @ T_j
-        C_M = X_remaining.T @ C_j
-        M_diff = T_M - C_M
+            # Skip if one of the groups has zero weighted mass.
+            if T_wt <= eps or C_wt <= eps:
+                continue
 
-        total_bal += torch.sum(M_diff ** 2)
+            # Normalized weighted treatment/control sample weights.
+            # T_j = u ⊙ X_j / u^T X_j
+            # C_j = u ⊙ (1 - X_j) / u^T (1 - X_j)
+            T_j = u * treatment / (T_wt + eps)
+            C_j = u * control / (C_wt + eps)
+
+            # Weighted first-order moments of all remaining features.
+            T_M = X_remaining.T @ T_j
+            C_M = X_remaining.T @ C_j
+
+            # Difference in treatment/control moments.
+            M_diff = T_M - C_M
+
+            # Same squared moment-difference objective.
+            total_bal += torch.sum(M_diff ** 2)
 
     return total_bal
 
