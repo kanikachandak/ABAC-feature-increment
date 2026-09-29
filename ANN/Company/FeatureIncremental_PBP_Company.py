@@ -44,6 +44,13 @@ Artefacts saved
   Model/PBP/<prep_name>/ArtificialNeuralNetwork_final.pth
   Results/Company/PBP/<prep_name>/Seed_0/results.csv
   consolidated_results.csv   ← 12-case summary across all algos/prep_types
+
+Changes from baseline
+─────────────────────
+ - Added old/current feature-set data loading, preprocessing, and PBP partitioning.
+ - Added separate old/current ANN models and parameter initialization for the new feature.
+ - Added per-sample weights with balancing, normalization, and model regularization.
+ - Added alternating optimization of old/current models and sample weights with FedAvg.
 """
 
 import argparse
@@ -920,7 +927,7 @@ def main(prep_type):
 # ═══════════════════════════════════════════════════════════════════════════════
 #  PREP  mode
 # ═══════════════════════════════════════════════════════════════════════════════
-
+### Unmodified for now
 def run_prep(prep_type):
     """Prepare and persist encoded tensors for multimachine training."""
     prep_names = {2: "ARFE", 3: "AVC", 4: "ARFE_AVC", 5: "NaiveNA"}
@@ -969,7 +976,7 @@ def run_prep(prep_type):
 # ═══════════════════════════════════════════════════════════════════════════════
 #  MULTIMACHINE  mode
 # ═══════════════════════════════════════════════════════════════════════════════
-
+### Unmodified for now
 def run_federated_multimachine(rank, world_size, prep_type, prep_name,
                                master_addr, master_port, base_dir):
     """
