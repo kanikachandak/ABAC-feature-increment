@@ -32,6 +32,8 @@ htmlcov/
 *.log
 *.pdf
 logs/
+Tensors/
+Results/
 
 # Temporary and office lock files
 .~lock.*#
