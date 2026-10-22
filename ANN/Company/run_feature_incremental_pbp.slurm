@@ -1,5 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=feat-incr-pbp
+#SBATCH --partition=compute
 #SBATCH --output=slurm-%x-%j.out
 #SBATCH --error=slurm-%x-%j.err
 #SBATCH --ntasks=1
