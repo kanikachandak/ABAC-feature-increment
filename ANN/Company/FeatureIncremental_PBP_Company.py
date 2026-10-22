@@ -103,6 +103,23 @@ def resolve_best_feature(columns):
     return 0, cols[0]
 
 
+def resolve_feature_indices(old_columns, current_columns):
+    """Map old attributes to their positions in the current feature matrix."""
+    old_keys = _column_keys(old_columns)
+    current_keys = _column_keys(current_columns)
+    current_positions = {key: index for index, key in enumerate(current_keys)}
+    missing = [key for key in old_keys if key not in current_positions]
+    if missing:
+        raise ValueError(f"Current dataset is missing old attributes: {missing}")
+    old_indices = [current_positions[key] for key in old_keys]
+    old_key_set = set(old_keys)
+    new_indices = [index for index, key in enumerate(current_keys)
+                   if key not in old_key_set]
+    if not new_indices:
+        raise ValueError("Current dataset does not contain a new feature")
+    return old_indices, new_indices
+
+
 # ─── Model definitions ────────────────────────────────────────────────────────
 
 class ArtificialNeuralNetwork(nn.Module):
@@ -117,7 +134,7 @@ class ArtificialNeuralNetwork(nn.Module):
         self.fc2               = nn.Linear(hidden_layer_size, 1)
         self.relu              = nn.ReLU()
         self.sigmoid           = nn.Sigmoid()
-        self.criterion         = nn.BCELoss(reduction=None) # per sample bce loss is needed
+        self.criterion         = nn.BCELoss(reduction='none') # per sample bce loss is needed
         self.optimizer         = optim.Adam
 
     def forward(self, x):
@@ -196,43 +213,77 @@ def aggregate_multithread(model, world_size):
         param.data /= world_size
 
 
-def aggregate_multimachine(model, rank, n_clients=N_CLIENTS):
+def aggregate_multimachine(rank, *models, n_clients=N_CLIENTS):
     """
     FedAvg: reduce to server (rank 0) → average over n_clients → broadcast.
     Server acts as pure aggregator; its initialisation weights are not
     included in the average (divide by n_clients, not world_size).
     """
-    for param in model.parameters():
-        dist.reduce(param.data, dst=0, op=dist.ReduceOp.SUM)
-        if rank == 0:
-            param.data /= n_clients
-        dist.broadcast(param.data, src=0)
+    for model in models:
+        for param in model.parameters():
+            # The server is not a training client. Clear its local copy before
+            # reduction so the sum contains only ranks 1..N_CLIENTS.
+            if rank == 0:
+                param.data.zero_()
+            dist.reduce(param.data, dst=0, op=dist.ReduceOp.SUM)
+            if rank == 0:
+                param.data /= n_clients
+            dist.broadcast(param.data, src=0)
 
 
 # ─── Attribute mapping helpers ────────────────────────────────────────────────
 
+def _column_keys(columns):
+    """Give duplicate CSV columns stable identities (name, occurrence)."""
+    counts = {}
+    keys = []
+    for column in columns:
+        occurrence = counts.get(column, 0)
+        keys.append((column, occurrence))
+        counts[column] = occurrence + 1
+    return keys
+
+
 def GetAttributeMapping(data, grp=None, grp_gap=20, map_type=1):
-    mapping = {"NotA": -1, 0: 0, "YES": 1, "NO": 0}
-    if map_type == 1:
-        for col in data.columns[:4]:
-            cnt = 1
-            for val in data[col].unique():
-                if val != "NotA":
-                    mapping[val] = cnt; cnt += 1
-    elif map_type == 2:
-        for col in data.columns[1:3]:
-            cnt = 1
-            for val in data[col].unique():
-                if val != "NotA":
-                    mapping[val] = cnt; cnt += 1
-        for g in grp:
-            grp_num = 1
-            for member in grp[g]:
-                mem_num = 1
-                for val in member:
-                    mapping[val] = grp_num * grp_gap + mem_num; mem_num += 1
-                grp_num += 1
-    return mapping
+    """Build an encoding per attribute, never one flat mapping for all columns."""
+    mappings = {}
+    keys = _column_keys(data.columns)
+    grouped_values = {}
+    if map_type == 2 and grp:
+        for group_name, groups in grp.items():
+            grouped_values[group_name] = {
+                value: group_number * grp_gap + member_number
+                for group_number, members in enumerate(groups, 1)
+                for member_number, value in enumerate(members, 1)
+            }
+
+    for index, (key, column) in enumerate(zip(keys, data.columns)):
+        column_map = {"NotA": -1, 0: 0, "YES": 1, "NO": 0}
+        if map_type == 2 and column in grouped_values:
+            column_map.update(grouped_values[column])
+
+        # Encode every categorical attribute. This also covers an inserted
+        # feature, while preserving the original order-based values for the
+        # existing ungrouped columns.
+        next_value = 1
+        for value in data.iloc[:, index].dropna().unique():
+            if value not in column_map:
+                column_map[value] = next_value
+                next_value += 1
+        mappings[key] = column_map
+    return mappings
+
+
+def encode_attributes(data, mapping):
+    """Apply per-column mappings using duplicate-column-aware identities."""
+    # Object dtype is required because categorical string columns are being
+    # replaced by numeric codes.
+    encoded = data.copy().astype(object)
+    for index, key in enumerate(_column_keys(encoded.columns)):
+        column_map = mapping.get(key, {})
+        if column_map:
+            encoded.iloc[:, index] = encoded.iloc[:, index].replace(column_map)
+    return encoded
 
 
 def same_conditions(col1, col2):
@@ -246,19 +297,20 @@ def chk_nota(col):
 
 # ─── Data preparation (policy-enforcement artefacts removed) ──────────────────
 # Prepare the data for Training and Testing based on relation
-def GetPreparedData(train_data, test_data, prep_type=5, seed=0,prep_name="NaiveNA"):
+def GetPreparedData(train_data, test_data, prep_type=5, seed=0,
+                    prep_name="NaiveNA", mapping=None):
     data = pd.concat([train_data, test_data], axis=0)
+    if mapping is None:
+        mapping = GetAttributeMapping(data, grp=attr_grp,
+                                      map_type=1 if prep_type in (1, 2, 5) else 2)
     if prep_type == 1:  # Naive (Normal encoding)
         map_type = 1
-        mapping = GetAttributeMapping(data, grp=attr_grp, map_type=map_type)
-        print(mapping)
-        data_encoded = data.replace(mapping)
+        data_encoded = encode_attributes(data, mapping)
     elif (
         prep_type == 2
     ):  # Columns for same attribute values in subject and object (ARFE)
         map_type = 1
-        mapping = GetAttributeMapping(data, grp=attr_grp, map_type=map_type)
-        data_encoded = data.replace(mapping)
+        data_encoded = encode_attributes(data, mapping)
         data_encoded["sameProj"] = data_encoded.apply(
             lambda x: same_conditions(x["Project_name"], x["Project_Name"]), axis=1
         )
@@ -273,14 +325,12 @@ def GetPreparedData(train_data, test_data, prep_type=5, seed=0,prep_name="NaiveN
         prep_type == 3
     ):  # Grouping of attributes (Encoding based on atrribute group) (AVC)
         map_type = 2
-        mapping = GetAttributeMapping(data, grp=attr_grp, map_type=map_type)
-        data_encoded = data.replace(mapping)
+        data_encoded = encode_attributes(data, mapping)
     elif (
         prep_type == 4
     ):  # Grouping of attributes + Columns for same attribute values in subject and object (ARFE + AVC)
         map_type = 2
-        mapping = GetAttributeMapping(data, grp=attr_grp, map_type=map_type)
-        data_encoded = data.replace(mapping)
+        data_encoded = encode_attributes(data, mapping)
         data_encoded["sameProj"] = data_encoded.apply(
             lambda x: same_conditions(x["Project_name"], x["Project_Name"]), axis=1
         )
@@ -293,8 +343,7 @@ def GetPreparedData(train_data, test_data, prep_type=5, seed=0,prep_name="NaiveN
         data_encoded = data_encoded.drop("Project_Name", axis=1)
     elif prep_type == 5:  # Naive + NACol (Type 1 with extra encoding for NA_Cols)
         map_type = 1
-        mapping = GetAttributeMapping(data, grp=attr_grp, map_type=map_type)
-        data_encoded = data.replace(mapping)
+        data_encoded = encode_attributes(data, mapping)
         data_encoded["Proj_NA"] = data_encoded.apply(
             lambda x: chk_nota(x["Project_name"]), axis=1
         )
@@ -460,7 +509,8 @@ def model_wt_regulariser(model):
 
 # ─── Train / Test ─────────────────────────────────────────────────────────────
 
-def train_local(rank, prev_model, prev_loader, curr_model, curr_loader, device):
+def train_local(rank, prev_model, prev_loader, curr_model, curr_loader, device,
+                old_feature_indices):
 
     n_old = len(prev_loader.dataset)
     n_curr = len(curr_loader.dataset)
@@ -529,7 +579,8 @@ def train_local(rank, prev_model, prev_loader, curr_model, curr_loader, device):
 
             # w(1) fixed here
             consistency_reg = LAMBDA_CON * torch.sum(
-                (prev_model.fc1.weight.detach() - curr_model.fc1.weight[:, :-1]) ** 2
+                (prev_model.fc1.weight.detach() -
+                 curr_model.fc1.weight[:, old_feature_indices]) ** 2
             )
 
             model_reg = LAMBDA_W * model_wt_regulariser(curr_model)
@@ -551,7 +602,8 @@ def train_local(rank, prev_model, prev_loader, curr_model, curr_loader, device):
             pred_loss = torch.sum(u1_b * bce)
             # w(2) fixed here
             consistency_reg = LAMBDA_CON * torch.sum(
-                (prev_model.fc1.weight - curr_model.fc1.weight[:, :-1].detach()) ** 2
+                (prev_model.fc1.weight -
+                 curr_model.fc1.weight[:, old_feature_indices].detach()) ** 2
             )
             model_reg = LAMBDA_W * model_wt_regulariser(prev_model)
             loss = pred_loss + consistency_reg + model_reg
@@ -734,7 +786,7 @@ def run_federated_multithread(
     curr_yes_no_counts, curr_partition_details,
 
     results_dir, model_path, time_file, log_file,
-    base_dir, prep_name,
+    base_dir, prep_name, old_feature_indices, new_feature_indices,
 ):
     setup_multithread(rank, world_size)
     device = torch.device("cpu")
@@ -744,7 +796,7 @@ def run_federated_multithread(
 
     with torch.no_grad():
         # copy old model weights into new model only for old features
-        curr_model.fc1.weight[:, :-1].copy_(prev_model.fc1.weight)
+        curr_model.fc1.weight[:, old_feature_indices].copy_(prev_model.fc1.weight)
 
         # everything after 1st layer is unchanged by new input feature
         curr_model.fc1.bias.copy_(prev_model.fc1.bias)
@@ -801,7 +853,10 @@ def run_federated_multithread(
         if rank == 0:
             print(f"[MT] Round {r+1}/{fed_rounds}")
 
-        train_time = train_local(rank, prev_model, prev_loaders[rank], curr_model, curr_loaders[rank], device)
+        train_time = train_local(
+            rank, prev_model, prev_loaders[rank], curr_model, curr_loaders[rank],
+            device, old_feature_indices,
+        )
         aggregate_multithread(prev_model, world_size)
         aggregate_multithread(curr_model, world_size)
 
@@ -872,31 +927,54 @@ def main(prep_type):
             os.path.join(current_folder_path, "Dataset", "test_company.csv")
         )
 
-        X_prev_train, X_prev_test, y_prev_train, y_prev_test, mapping_prev = (
-            GetPreparedData(
-                train_data_prev, test_data_prev, prep_type=prep_type,
-                seed=seed, prep_name=prep_name,
-            )
-        )
-
-        # Current feature set = old features + one new feature
+        # Build one per-attribute mapping from both feature sets. This keeps
+        # shared attributes numerically identical without mixing meanings
+        # across different columns.
         train_data_curr = pd.read_csv(
             os.path.join(current_folder_path, "Dataset", "new_train_company.csv")
         )
         test_data_curr = pd.read_csv(
             os.path.join(current_folder_path, "Dataset", "new_test_company.csv")
         )
+        shared_mapping_data = pd.concat(
+            [train_data_prev, test_data_prev, train_data_curr, test_data_curr],
+            axis=0,
+        )
+        mapping_type = 1 if prep_type in (1, 2, 5) else 2
+        shared_mapping = GetAttributeMapping(
+            shared_mapping_data, grp=attr_grp, map_type=mapping_type
+        )
 
+        X_prev_train, X_prev_test, y_prev_train, y_prev_test, mapping_prev = (
+            GetPreparedData(
+                train_data_prev, test_data_prev, prep_type=prep_type,
+                seed=seed, prep_name=prep_name,
+                mapping=shared_mapping,
+            )
+        )
+
+        # Current feature set = old features + one new feature
         X_curr_train, X_curr_test, y_curr_train, y_curr_test, mapping_curr = (
             GetPreparedData(
                 train_data_curr, test_data_curr, prep_type=prep_type,
                 seed=seed, prep_name=prep_name,
+                mapping=shared_mapping,
             )
         )
         
+        # # temp check mappings -> mappings are different; need to generate consistent mappings
+        # print("\n=== OLD MAPPING ===")
+        # print(mapping_prev)
+
+        # print("\n=== NEW MAPPING ===")
+        # print(mapping_curr)
+
         # Resolve the same PBP perception feature in both feature sets
         best_feature_index_prev, best_feature_name_prev = resolve_best_feature(X_prev_train.columns)
         best_feature_index_curr, best_feature_name_curr = resolve_best_feature(X_curr_train.columns)
+        old_feature_indices, new_feature_indices = resolve_feature_indices(
+            X_prev_train.columns, X_curr_train.columns
+        )
 
         # Convert old feature set to tensors
         X_prev_train_t = torch.tensor(X_prev_train.values, dtype=torch.float32)
@@ -938,8 +1016,8 @@ def main(prep_type):
                     X_curr_clients, y_curr_clients, curr_yes_no_counts,
                     curr_partition_details,
 
-                    results_dir, model_path, time_file, log_file,
-                    base_dir, prep_name,
+                     results_dir, model_path, time_file, log_file,
+                     base_dir, prep_name, old_feature_indices, new_feature_indices,
                 ),
                 nprocs=world_size, join=True, start_method="spawn",
             )
@@ -953,7 +1031,7 @@ def main(prep_type):
 # ═══════════════════════════════════════════════════════════════════════════════
 ### Unmodified for now
 def run_prep(prep_type):
-    """Prepare and persist encoded tensors for multimachine training."""
+    """Prepare and persist old/current tensors for multimachine training."""
     prep_names = {2: "ARFE", 3: "AVC", 4: "ARFE_AVC", 5: "NaiveNA"}
     prep_name  = prep_names.get(prep_type, f"Prep{prep_type}")
     seed       = 0
@@ -962,36 +1040,77 @@ def run_prep(prep_type):
     tensor_dir = os.path.join(base_dir, "Tensors", ALGO, prep_name)
     os.makedirs(tensor_dir, exist_ok=True)
 
-    train_data = pd.read_csv(os.path.join(base_dir, "Dataset", "train_company.csv"))
-    test_data  = pd.read_csv(os.path.join(base_dir, "Dataset", "test_company.csv"))
+    train_data_prev = pd.read_csv(os.path.join(base_dir, "Dataset", "train_company.csv"))
+    test_data_prev  = pd.read_csv(os.path.join(base_dir, "Dataset", "test_company.csv"))
+    train_data_curr = pd.read_csv(os.path.join(base_dir, "Dataset", "new_train_company.csv"))
+    test_data_curr  = pd.read_csv(os.path.join(base_dir, "Dataset", "new_test_company.csv"))
+
+    mapping_type = 1 if prep_type in (1, 2, 5) else 2
+    shared_mapping = GetAttributeMapping(
+        pd.concat([train_data_prev, test_data_prev, train_data_curr, test_data_curr],
+                  axis=0),
+        grp=attr_grp,
+        map_type=mapping_type,
+    )
 
     np.random.seed(seed)
-    (X_train, X_test, y_train, y_test, mapping) = GetPreparedData(
-        train_data, test_data,
+    X_prev, X_prev_test, y_prev, y_prev_test, _ = GetPreparedData(
+        train_data_prev, test_data_prev,
         prep_type=prep_type, seed=seed, prep_name=prep_name,
+        mapping=shared_mapping,
+    )
+    X_curr, X_curr_test, y_curr, y_curr_test, _ = GetPreparedData(
+        train_data_curr, test_data_curr,
+        prep_type=prep_type, seed=seed, prep_name=prep_name,
+        mapping=shared_mapping,
     )
 
-    # Perception-based feature (fixed by domain knowledge, resolved by name)
-    best_feature_index, best_feature_name = resolve_best_feature(X_train.columns)
-    print(f"[PREP] Perception feature: '{best_feature_name}' "
-          f"(column index {best_feature_index})")
-
-    X_train_t = torch.tensor(X_train.values, dtype=torch.float32)
-    X_test_t  = torch.tensor(X_test.values,  dtype=torch.float32)
-    y_train_t = torch.tensor(y_train.values, dtype=torch.float32).view(-1, 1)
-    y_test_t  = torch.tensor(y_test.values,  dtype=torch.float32).view(-1, 1)
-
-    (X_clients, y_clients, _, _,
-     _) = partition_dataset(
-        X_train_t, y_train_t, best_feature_index, best_feature_name, N_CLIENTS
+    old_feature_indices, new_feature_indices = resolve_feature_indices(
+        X_prev.columns, X_curr.columns
     )
 
-    for i in range(N_CLIENTS):
-        torch.save(X_clients[i], os.path.join(tensor_dir, f"client_{i+1}_X.pt"))
-        torch.save(y_clients[i], os.path.join(tensor_dir, f"client_{i+1}_y.pt"))
-    torch.save(X_test_t, os.path.join(tensor_dir, "test_X.pt"))
-    torch.save(y_test_t, os.path.join(tensor_dir, "test_y.pt"))
+    def tensorize(X_train, X_test, y_train, y_test):
+        return (
+            torch.tensor(X_train.values, dtype=torch.float32),
+            torch.tensor(X_test.values, dtype=torch.float32),
+            torch.tensor(y_train.values, dtype=torch.float32).view(-1, 1),
+            torch.tensor(y_test.values, dtype=torch.float32).view(-1, 1),
+        )
 
+    X_prev_t, X_prev_test_t, y_prev_t, y_prev_test_t = tensorize(
+        X_prev, X_prev_test, y_prev, y_prev_test
+    )
+    X_curr_t, X_curr_test_t, y_curr_t, y_curr_test_t = tensorize(
+        X_curr, X_curr_test, y_curr, y_curr_test
+    )
+
+    def partition(X_train, y_train):
+        best_index, best_name = resolve_best_feature(X_train.columns)
+        return partition_dataset(
+            torch.tensor(X_train.values, dtype=torch.float32),
+            torch.tensor(y_train.values, dtype=torch.float32).view(-1, 1),
+            best_index, best_name, N_CLIENTS,
+        )
+
+    prev_clients = partition(X_prev, y_prev)
+    curr_clients = partition(X_curr, y_curr)
+
+    for prefix, clients in (("prev", prev_clients), ("curr", curr_clients)):
+        X_clients, y_clients = clients[0], clients[1]
+        for i in range(N_CLIENTS):
+            torch.save(X_clients[i], os.path.join(tensor_dir, f"{prefix}_client_{i+1}_X.pt"))
+            torch.save(y_clients[i], os.path.join(tensor_dir, f"{prefix}_client_{i+1}_y.pt"))
+
+    torch.save(X_prev_test_t, os.path.join(tensor_dir, "prev_test_X.pt"))
+    torch.save(y_prev_test_t, os.path.join(tensor_dir, "prev_test_y.pt"))
+    torch.save(X_curr_test_t, os.path.join(tensor_dir, "curr_test_X.pt"))
+    torch.save(y_curr_test_t, os.path.join(tensor_dir, "curr_test_y.pt"))
+    torch.save({
+        "old_feature_indices": old_feature_indices,
+        "new_feature_indices": new_feature_indices,
+    }, os.path.join(tensor_dir, "feature_indices.pt"))
+
+    print(f"[PREP] Old features: {X_prev.shape[1]} | current features: {X_curr.shape[1]}")
     print(f"[PREP] Tensors saved → {tensor_dir}")
     print(f"[PREP] Ready for: python {__file__} --mode multimachine "
           f"--prep_type {prep_type} --rank <R> --master_addr <IP>")
@@ -1005,8 +1124,9 @@ def run_federated_multimachine(rank, world_size, prep_type, prep_name,
                                master_addr, master_port, base_dir):
     """
     Each physical VM runs this with its assigned rank.
-      rank 0  → Global server: aggregates, evaluates, saves model.
-      rank 1-4 → FL clients: train locally, participate in FedAvg.
+      rank 0  → Global server: aggregates, evaluates, saves current model.
+      rank 1-4 → FL clients: train old/current models locally, then participate
+                  in FedAvg for both models.
     """
     setup_multimachine(rank, world_size, master_addr, master_port)
     device = torch.device("cpu")
@@ -1023,23 +1143,64 @@ def run_federated_multimachine(rank, world_size, prep_type, prep_name,
         os.makedirs(model_path,  exist_ok=True)
         initialize_time_file(time_file)
 
-    if rank == 0:
-        X_test_t = torch.load(os.path.join(tensor_dir, "test_X.pt"))
-        y_test_t = torch.load(os.path.join(tensor_dir, "test_y.pt"))
-        input_dim   = X_test_t.shape[1]
-        test_loader = DataLoader(TensorDataset(X_test_t, y_test_t),
-                                 batch_size=32, shuffle=False)
-        n_test = len(X_test_t)
-        print(f"[Server rank=0] Test set: {n_test} records | input_dim={input_dim}")
-    else:
-        X_client = torch.load(os.path.join(tensor_dir, f"client_{rank}_X.pt"))
-        y_client = torch.load(os.path.join(tensor_dir, f"client_{rank}_y.pt"))
-        input_dim    = X_client.shape[1]
-        local_loader = DataLoader(TensorDataset(X_client, y_client),
-                                  batch_size=32, shuffle=True)
-        print(f"[Client rank={rank}] Local data: {len(X_client)} records")
+    feature_indices = torch.load(os.path.join(tensor_dir, "feature_indices.pt"))
+    old_feature_indices = feature_indices["old_feature_indices"]
 
-    model = ArtificialNeuralNetwork(input_dim).to(device)
+    if rank == 0:
+        X_prev_test = torch.load(os.path.join(tensor_dir, "prev_test_X.pt"))
+        y_prev_test = torch.load(os.path.join(tensor_dir, "prev_test_y.pt"))
+        X_curr_test = torch.load(os.path.join(tensor_dir, "curr_test_X.pt"))
+        y_curr_test = torch.load(os.path.join(tensor_dir, "curr_test_y.pt"))
+        prev_test_loader = DataLoader(
+            TensorDataset(X_prev_test, y_prev_test), batch_size=32, shuffle=False
+        )
+        curr_test_loader = DataLoader(
+            TensorDataset(X_curr_test, y_curr_test), batch_size=32, shuffle=False
+        )
+        n_test = len(X_curr_test)
+        prev_input_dim = X_prev_test.shape[1]
+        curr_input_dim = X_curr_test.shape[1]
+        print(f"[Server rank=0] Old/current features: "
+              f"{prev_input_dim}/{curr_input_dim} | test={n_test}")
+    else:
+        X_prev_client = torch.load(
+            os.path.join(tensor_dir, f"prev_client_{rank}_X.pt")
+        )
+        y_prev_client = torch.load(
+            os.path.join(tensor_dir, f"prev_client_{rank}_y.pt")
+        )
+        X_curr_client = torch.load(
+            os.path.join(tensor_dir, f"curr_client_{rank}_X.pt")
+        )
+        y_curr_client = torch.load(
+            os.path.join(tensor_dir, f"curr_client_{rank}_y.pt")
+        )
+        prev_loader = DataLoader(
+            TensorDataset(
+                X_prev_client, y_prev_client,
+                torch.arange(len(X_prev_client)),
+            ),
+            batch_size=32, shuffle=True,
+        )
+        curr_loader = DataLoader(
+            TensorDataset(
+                X_curr_client, y_curr_client,
+                torch.arange(len(X_curr_client)),
+            ),
+            batch_size=32, shuffle=True,
+        )
+        prev_input_dim = X_prev_client.shape[1]
+        curr_input_dim = X_curr_client.shape[1]
+        print(f"[Client rank={rank}] Old/current records: "
+              f"{len(X_prev_client)}/{len(X_curr_client)}")
+
+    prev_model = ArtificialNeuralNetwork(prev_input_dim).to(device)
+    curr_model = ArtificialNeuralNetwork(curr_input_dim).to(device)
+    with torch.no_grad():
+        curr_model.fc1.weight[:, old_feature_indices].copy_(prev_model.fc1.weight)
+        curr_model.fc1.bias.copy_(prev_model.fc1.bias)
+        curr_model.fc2.weight.copy_(prev_model.fc2.weight)
+        curr_model.fc2.bias.copy_(prev_model.fc2.bias)
 
     fed_rounds  = 50
     start       = time.time()
@@ -1053,30 +1214,37 @@ def run_federated_multimachine(rank, world_size, prep_type, prep_name,
             print(f"[Client {rank}] Training round {r+1}/{fed_rounds}")
 
         if rank != 0:
-            train_local(rank, model, local_loader, device)
+            train_local(
+                rank, prev_model, prev_loader, curr_model, curr_loader, device,
+                old_feature_indices,
+            )
 
-        aggregate_multimachine(model, rank, n_clients=N_CLIENTS)
+        aggregate_multimachine(
+            rank, prev_model, curr_model, n_clients=N_CLIENTS
+        )
         end = time.time()
 
         if rank == 0:
-            acc, prec, rec, f1, inf_t = evaluate(model, test_loader, device)
+            acc, prec, rec, f1, inf_t = evaluate(curr_model, curr_test_loader, device)
             total_inf_t.extend(inf_t)
-            save_round_result(model.__class__.__name__,
+            save_round_result(curr_model.__class__.__name__,
                               acc, prec, rec, f1, results_dir)
             with open(log_file, "a") as lf:
                 lf.write(f"Round {r+1}  AvgInference={np.mean(inf_t):.10f}s\n")
 
     total_train_time = end - start
-    save_training_time(model.__class__.__name__, rank, total_train_time, time_file)
+    save_training_time(curr_model.__class__.__name__, rank, total_train_time, time_file)
 
     if rank == 0:
-        save_path = os.path.join(model_path, f"{model.__class__.__name__}_final.pth")
-        torch.save(model.state_dict(), save_path)
+        save_path = os.path.join(
+            model_path, f"{curr_model.__class__.__name__}_feat_incr_final.pth"
+        )
+        torch.save(curr_model.state_dict(), save_path)
         print(f"[Server] Model saved → {save_path}")
 
         avg_inf_ms = np.mean(total_inf_t) * 1000 if total_inf_t else 0.0
         save_consolidated_result(
-            base_dir, ALGO, prep_name, model.__class__.__name__,
+            base_dir, ALGO, prep_name, curr_model.__class__.__name__,
             acc, prec, rec, f1,
             total_train_time, avg_inf_ms,
             -1, int(n_test),
