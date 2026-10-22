@@ -4,7 +4,7 @@
 #SBATCH --output=slurm-%x-%j.out
 #SBATCH --error=slurm-%x-%j.err
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=128
 #SBATCH --mem=16G
 #SBATCH --time=24:00:00
 #SBATCH --mail-user=f20231101@hyderabad.bits-pilani.ac.in
