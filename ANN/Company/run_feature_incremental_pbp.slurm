@@ -12,25 +12,12 @@
 
 set -euo pipefail
 
-# SLURM may execute a copied batch script from /var/spool, so BASH_SOURCE is
-# not a reliable way to locate the repository. SLURM_SUBMIT_DIR is the actual
-# directory from which sbatch was invoked.
-SUBMIT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
-if [[ -f "$SUBMIT_DIR/Company/FeatureIncremental_PBP_Company.py" ]]; then
-    ANN_DIR="$(cd -- "$SUBMIT_DIR" && pwd)"
-elif [[ -f "$SUBMIT_DIR/ANN/Company/FeatureIncremental_PBP_Company.py" ]]; then
-    ANN_DIR="$(cd -- "$SUBMIT_DIR/ANN/Company" && pwd)"
-else
-    echo "ERROR: Could not locate ANN/Company from submit directory: $SUBMIT_DIR" >&2
-    exit 1
-fi
-cd "$ANN_DIR"
+# Submit this job from ANN/:
+#   sbatch Company/run_feature_incremental_pbp.slurm
+cd "$SLURM_SUBMIT_DIR/Company"
 
-# The one-time setup inside ANN/ is:
-#   uv venv .venv --python /usr/bin/python3.11
-#   uv pip install --python .venv/bin/python -r requirements.txt
-# Override PYTHON only if the ANN environment has a nonstandard location.
-PYTHON="${PYTHON:-$ANN_DIR/.venv/bin/python}"
+# The environment is located in ANN/.venv.
+PYTHON="$SLURM_SUBMIT_DIR/.venv/bin/python"
 if [[ ! -x "$PYTHON" ]]; then
     echo "ERROR: Python executable not found or not executable: $PYTHON" >&2
     echo "Create the environment with uv or submit with --export=PYTHON=/path/to/python." >&2
