@@ -12,18 +12,25 @@
 
 set -euo pipefail
 
-# Run from the directory containing this script so all paths used by the
-# Python program (Dataset/, Results/, Model/) resolve correctly.
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
-cd "$SCRIPT_DIR"
+# SLURM may execute a copied batch script from /var/spool, so BASH_SOURCE is
+# not a reliable way to locate the repository. SLURM_SUBMIT_DIR is the actual
+# directory from which sbatch was invoked.
+SUBMIT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
+if [[ -f "$SUBMIT_DIR/Company/FeatureIncremental_PBP_Company.py" ]]; then
+    ANN_DIR="$(cd -- "$SUBMIT_DIR" && pwd)"
+elif [[ -f "$SUBMIT_DIR/ANN/Company/FeatureIncremental_PBP_Company.py" ]]; then
+    ANN_DIR="$(cd -- "$SUBMIT_DIR/ANN/Company" && pwd)"
+else
+    echo "ERROR: Could not locate ANN/Company from submit directory: $SUBMIT_DIR" >&2
+    exit 1
+fi
+cd "$ANN_DIR"
 
-# The recommended one-time setup is:
-#   cd "$PROJECT_DIR"
+# The one-time setup inside ANN/ is:
 #   uv venv .venv --python /usr/bin/python3.11
-#   uv pip install --python .venv/bin/python -r ANN/requirements.txt
-# Override PYTHON with an absolute path if the environment lives elsewhere.
-PYTHON="${PYTHON:-$PROJECT_DIR/.venv/bin/python}"
+#   uv pip install --python .venv/bin/python -r requirements.txt
+# Override PYTHON only if the ANN environment has a nonstandard location.
+PYTHON="${PYTHON:-$ANN_DIR/.venv/bin/python}"
 if [[ ! -x "$PYTHON" ]]; then
     echo "ERROR: Python executable not found or not executable: $PYTHON" >&2
     echo "Create the environment with uv or submit with --export=PYTHON=/path/to/python." >&2
