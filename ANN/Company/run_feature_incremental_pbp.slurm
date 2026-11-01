@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=16G
-#SBATCH --time=24:00:00
+#SBATCH --time=72:00:00
 #SBATCH --mail-user=f20231101@hyderabad.bits-pilani.ac.in
 #SBATCH --mail-type=BEGIN,END,FAIL
 
@@ -27,6 +27,10 @@ fi
 # The Python program launches four CPU worker processes internally.
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
+export PYTHONUNBUFFERED=1
+
+# Submit with: sbatch --export=ALL,PREP_TYPE=2 Company/run_feature_incremental_pbp.slurm
+PREP_TYPE="${PREP_TYPE:?Submit with --export=ALL,PREP_TYPE=2|3|4|5}"
 
 echo "Job ${SLURM_JOB_ID:-local} started on $(hostname)"
 echo "Working directory: $PWD"
@@ -36,6 +40,6 @@ echo "Python: $PYTHON"
 # No --prep_type means the program runs prep types 2, 3, 4, and 5 in order:
 # ARFE, AVC, ARFE_AVC, and NaiveNA. Sequential execution keeps the shared
 # consolidated_results.csv and Final/ aggregation outputs race-free.
-"$PYTHON" FeatureIncremental_PBP_Company.py --mode multithread
+"$PYTHON" -u FeatureIncremental_PBP_Company.py --mode multithread --prep_type="$PREP_TYPE" 
 
-echo "Feature-incremental PBP job completed."
+echo "Feature-incremental PBP completed ON PREP TYPE $PREP_TYPE."
