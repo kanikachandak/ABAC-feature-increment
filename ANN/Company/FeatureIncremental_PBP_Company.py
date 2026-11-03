@@ -92,6 +92,7 @@ LAMBDA_W = 1e-4
 # when some columns are dropped.  Switch to "Department" if your perception
 # feature is the subject department instead of designation.
 BEST_FEATURE_NAME = "DESIGNATION"   # Subject Designation (reference perception)
+NEW_FEATURE_NAMES = {"WORK_LOCATION"}
 
 
 def resolve_best_feature(columns):
@@ -120,6 +121,60 @@ def resolve_feature_indices(old_columns, current_columns):
     return old_indices, new_indices
 
 
+def resolve_checkpoint_feature_indices(current_columns, old_columns,
+                                       old_input_dim,
+                                       new_feature_names=NEW_FEATURE_NAMES):
+    """Locate inserted feature columns and validate the baseline width.
+
+    Baseline checkpoints in this repository predate schema metadata, so the
+    processed old schema is checked against the expanded schema.  This both
+    identifies the explicitly named new attribute and prevents a silent
+    permutation of old columns.
+    """
+    current_keys = _column_keys(current_columns)
+    old_keys = _column_keys(old_columns)
+    new_indices = [index for index, (name, _) in enumerate(current_keys)
+                   if name in new_feature_names]
+    old_indices = [index for index in range(len(current_keys))
+                   if index not in set(new_indices)]
+    if not new_indices:
+        raise ValueError(
+            f"No new feature found. Expected one of {sorted(new_feature_names)}"
+        )
+    if len(old_indices) != old_input_dim or len(old_keys) != old_input_dim:
+        raise ValueError(
+            f"Old schema/checkpoint width mismatch: old schema={len(old_keys)}, "
+            f"expanded old columns={len(old_indices)}, checkpoint={old_input_dim}."
+        )
+    expanded_old_keys = [current_keys[index] for index in old_indices]
+    if expanded_old_keys != old_keys:
+        raise ValueError(
+            "Expanded dataset old-column order does not match the baseline "
+            f"schema. Baseline={old_keys}; expanded={expanded_old_keys}."
+        )
+    return old_indices, new_indices
+
+
+def load_baseline_state(checkpoint_path):
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(f"Baseline checkpoint not found: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        checkpoint = checkpoint["model_state_dict"]
+    required = {"fc1.weight", "fc1.bias", "fc2.weight", "fc2.bias"}
+    missing = required.difference(checkpoint.keys())
+    if missing:
+        raise ValueError(f"Baseline checkpoint is missing parameters: {sorted(missing)}")
+    state = {key: checkpoint[key].detach().cpu() for key in required}
+    if state["fc1.weight"].ndim != 2 or state["fc1.bias"].shape != (state["fc1.weight"].shape[0],):
+        raise ValueError("Baseline checkpoint has an invalid fc1 architecture")
+    if state["fc2.weight"].shape != (1, state["fc1.weight"].shape[0]):
+        raise ValueError("Baseline checkpoint has an incompatible fc2 architecture")
+    if state["fc2.bias"].shape != (1,):
+        raise ValueError("Baseline checkpoint has an invalid fc2 bias")
+    return state
+
+
 # ─── Model definitions ────────────────────────────────────────────────────────
 
 class ArtificialNeuralNetwork(nn.Module):
@@ -139,6 +194,78 @@ class ArtificialNeuralNetwork(nn.Module):
 
     def forward(self, x):
         return self.sigmoid(self.fc2(self.relu(self.fc1(x))))
+
+
+class DeltaFeatureANN(nn.Module):
+    """Expanded ANN with only the new-feature first-layer connections trainable.
+
+    ``fc1`` and ``fc2`` contain the frozen baseline model.  The trainable
+    parameter is an explicit delta for the columns identified by
+    ``new_feature_indices``.  This avoids trying to freeze individual slices of
+    a single PyTorch Parameter.
+    """
+
+    def __init__(self, baseline_state, input_dim, new_feature_indices,
+                 learning_rate=0.001, max_iter=200):
+        super().__init__()
+        old_weight = baseline_state["fc1.weight"]
+        hidden_size, old_input_dim = old_weight.shape
+        if len(new_feature_indices) + old_input_dim != input_dim:
+            raise ValueError(
+                f"Checkpoint input width is {old_input_dim}, expanded data "
+                f"width is {input_dim}, and {len(new_feature_indices)} new "
+                "feature columns were identified."
+            )
+
+        self.input_dim = input_dim
+        self.hidden_layer_size = hidden_size
+        self.learning_rate = learning_rate
+        self.max_iter = max_iter
+        self.criterion = nn.BCELoss(reduction="none")
+        self.new_feature_indices = torch.tensor(
+            list(new_feature_indices), dtype=torch.long
+        )
+
+        self.fc1 = nn.Linear(input_dim, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, 1)
+        expanded_weight = torch.zeros(
+            hidden_size, input_dim, dtype=old_weight.dtype
+        )
+        old_indices = [i for i in range(input_dim)
+                       if i not in set(new_feature_indices)]
+        expanded_weight[:, old_indices] = old_weight
+        self.fc1.weight.data.copy_(expanded_weight)
+        self.fc1.bias.data.copy_(baseline_state["fc1.bias"])
+        self.fc2.weight.data.copy_(baseline_state["fc2.weight"])
+        self.fc2.bias.data.copy_(baseline_state["fc2.bias"])
+
+        for parameter in self.fc1.parameters():
+            parameter.requires_grad = False
+        for parameter in self.fc2.parameters():
+            parameter.requires_grad = False
+
+        self.delta_fc1_weight = nn.Parameter(
+            torch.zeros(hidden_size, len(new_feature_indices),
+                        dtype=old_weight.dtype)
+        )
+
+    def forward(self, x):
+        delta_x = x.index_select(1, self.new_feature_indices.to(x.device))
+        hidden = F.linear(x, self.fc1.weight, self.fc1.bias)
+        hidden = hidden + F.linear(delta_x, self.delta_fc1_weight)
+        return torch.sigmoid(self.fc2(torch.relu(hidden)))
+
+    def merged_state_dict(self):
+        """Return a normal ANN state_dict representing P' = P + Delta P."""
+        state = {
+            "fc1.weight": self.fc1.weight.detach().clone(),
+            "fc1.bias": self.fc1.bias.detach().clone(),
+            "fc2.weight": self.fc2.weight.detach().clone(),
+            "fc2.bias": self.fc2.bias.detach().clone(),
+        }
+        indices = self.new_feature_indices.tolist()
+        state["fc1.weight"][:, indices] += self.delta_fc1_weight.detach()
+        return state
 
 
 models_dict = {"ArtificialNeuralNetwork": ArtificialNeuralNetwork}
@@ -207,10 +334,16 @@ def cleanup():
 
 # ─── Weight aggregation ───────────────────────────────────────────────────────
 
-def aggregate_multithread(model, world_size):
+def aggregate_multithread_multimachine_legacy(model, world_size):
     for param in model.parameters():
         dist.all_reduce(param.data, op=dist.ReduceOp.SUM)
         param.data /= world_size
+
+
+def aggregate_multithread(model, world_size):
+    """FedAvg only Delta P; frozen baseline parameters are not reduced."""
+    dist.all_reduce(model.delta_fc1_weight.data, op=dist.ReduceOp.SUM)
+    model.delta_fc1_weight.data /= world_size
 
 
 def aggregate_multimachine(rank, *models, n_clients=N_CLIENTS):
@@ -229,6 +362,17 @@ def aggregate_multimachine(rank, *models, n_clients=N_CLIENTS):
             if rank == 0:
                 param.data /= n_clients
             dist.broadcast(param.data, src=0)
+
+
+def aggregate_multimachine_delta(rank, model, n_clients=N_CLIENTS):
+    """FedAvg only Delta P for the server-plus-client multimachine layout."""
+    delta = model.delta_fc1_weight.data
+    if rank == 0:
+        delta.zero_()
+    dist.reduce(delta, dst=0, op=dist.ReduceOp.SUM)
+    if rank == 0:
+        delta /= n_clients
+    dist.broadcast(delta, src=0)
 
 
 # ─── Attribute mapping helpers ────────────────────────────────────────────────
@@ -274,8 +418,72 @@ def GetAttributeMapping(data, grp=None, grp_gap=20, map_type=1):
     return mappings
 
 
-def encode_attributes(data, mapping):
+def GetBaselineAttributeMapping(data, grp=None, grp_gap=20, map_type=1):
+    """Reproduce the flat mapping used by the original PBP_Company.py."""
+    mapping = {"NotA": -1, 0: 0, "YES": 1, "NO": 0}
+    if map_type == 1:
+        for col in data.columns[:4]:
+            count = 1
+            for value in data[col].unique():
+                if value != "NotA":
+                    mapping[value] = count
+                    count += 1
+    elif map_type == 2:
+        for col in data.columns[1:3]:
+            count = 1
+            for value in data[col].unique():
+                if value != "NotA":
+                    mapping[value] = count
+                    count += 1
+        for group_name in grp or {}:
+            group_number = 1
+            for members in grp[group_name]:
+                member_number = 1
+                for value in members:
+                    mapping[value] = group_number * grp_gap + member_number
+                    member_number += 1
+                group_number += 1
+    return mapping
+
+
+def encode_baseline_with_new_features(data, baseline_mapping,
+                                      new_feature_names=NEW_FEATURE_NAMES):
+    """Apply baseline mapping globally and new mappings only to new columns."""
+    # Object dtype is required because the targeted new column may change
+    # from strings to integer codes after the global baseline replacement.
+    encoded = data.replace(baseline_mapping).astype(object)
+    new_mapping = dict(baseline_mapping)
+
+    for index, column in enumerate(data.columns):
+        if column not in new_feature_names:
+            continue
+
+        next_value = 1
+        for value in data.iloc[:, index].unique():
+            if value != "NotA" and value not in new_mapping:
+                new_mapping[value] = next_value
+                next_value += 1
+
+        # Use raw values from the original column. This prevents newly added
+        # category keys from affecting any existing feature column.
+        encoded.iloc[:, index] = data.iloc[:, index].map(
+            lambda value: new_mapping.get(value, value)
+        )
+
+    return encoded
+
+
+def encode_attributes(data, mapping, uniform_mapping=False,
+                      new_feature_names=None):
     """Apply per-column mappings using duplicate-column-aware identities."""
+    if uniform_mapping:
+        # This is intentionally the same operation used by the baseline PBP
+        # implementation. Existing feature values must retain its assignments.
+        if new_feature_names:
+            return encode_baseline_with_new_features(
+                data, mapping, new_feature_names
+            )
+        return data.replace(mapping)
     # Object dtype is required because categorical string columns are being
     # replaced by numeric codes.
     encoded = data.copy().astype(object)
@@ -298,19 +506,24 @@ def chk_nota(col):
 # ─── Data preparation (policy-enforcement artefacts removed) ──────────────────
 # Prepare the data for Training and Testing based on relation
 def GetPreparedData(train_data, test_data, prep_type=5, seed=0,
-                    prep_name="NaiveNA", mapping=None):
+                    prep_name="NaiveNA", mapping=None,
+                    uniform_mapping=False, new_feature_names=None):
     data = pd.concat([train_data, test_data], axis=0)
     if mapping is None:
         mapping = GetAttributeMapping(data, grp=attr_grp,
                                       map_type=1 if prep_type in (1, 2, 5) else 2)
     if prep_type == 1:  # Naive (Normal encoding)
         map_type = 1
-        data_encoded = encode_attributes(data, mapping)
+        data_encoded = encode_attributes(
+            data, mapping, uniform_mapping, new_feature_names
+        )
     elif (
         prep_type == 2
     ):  # Columns for same attribute values in subject and object (ARFE)
         map_type = 1
-        data_encoded = encode_attributes(data, mapping)
+        data_encoded = encode_attributes(
+            data, mapping, uniform_mapping, new_feature_names
+        )
         data_encoded["sameProj"] = data_encoded.apply(
             lambda x: same_conditions(x["Project_name"], x["Project_Name"]), axis=1
         )
@@ -325,12 +538,16 @@ def GetPreparedData(train_data, test_data, prep_type=5, seed=0,
         prep_type == 3
     ):  # Grouping of attributes (Encoding based on atrribute group) (AVC)
         map_type = 2
-        data_encoded = encode_attributes(data, mapping)
+        data_encoded = encode_attributes(
+            data, mapping, uniform_mapping, new_feature_names
+        )
     elif (
         prep_type == 4
     ):  # Grouping of attributes + Columns for same attribute values in subject and object (ARFE + AVC)
         map_type = 2
-        data_encoded = encode_attributes(data, mapping)
+        data_encoded = encode_attributes(
+            data, mapping, uniform_mapping, new_feature_names
+        )
         data_encoded["sameProj"] = data_encoded.apply(
             lambda x: same_conditions(x["Project_name"], x["Project_Name"]), axis=1
         )
@@ -343,7 +560,9 @@ def GetPreparedData(train_data, test_data, prep_type=5, seed=0,
         data_encoded = data_encoded.drop("Project_Name", axis=1)
     elif prep_type == 5:  # Naive + NACol (Type 1 with extra encoding for NA_Cols)
         map_type = 1
-        data_encoded = encode_attributes(data, mapping)
+        data_encoded = encode_attributes(
+            data, mapping, uniform_mapping, new_feature_names
+        )
         data_encoded["Proj_NA"] = data_encoded.apply(
             lambda x: chk_nota(x["Project_name"]), axis=1
         )
@@ -419,7 +638,12 @@ def partition_dataset(X_train, y_train, best_feature, best_feature_name, n_clien
 # modified to retain original indices for sample weights
 def get_data_loaders(X_clients, y_clients, batch_size=32):
     data_loaders = []
-    for X, y in zip(X_clients, y_clients):
+    for client_number, (X, y) in enumerate(zip(X_clients, y_clients), start=1):
+        if len(X) == 0:
+            raise ValueError(
+                f"Client {client_number} has no samples; cannot create a "
+                "federated DataLoader."
+            )
         indices = torch.arange(len(X))
         dataset = TensorDataset(X, y, indices)
         data_loaders.append(
@@ -509,7 +733,7 @@ def model_wt_regulariser(model):
 
 # ─── Train / Test ─────────────────────────────────────────────────────────────
 
-def train_local(rank, prev_model, prev_loader, curr_model, curr_loader, device,
+def train_local_multimachine_legacy(rank, prev_model, prev_loader, curr_model, curr_loader, device,
                 old_feature_indices):
 
     n_old = len(prev_loader.dataset)
@@ -654,6 +878,35 @@ def train_local(rank, prev_model, prev_loader, curr_model, curr_loader, device,
     return elapsed
 
 
+def train_local(rank, model, loader, device, optimizer=None):
+    """Train only Delta P on the expanded labelled dataset."""
+    if optimizer is None:
+        optimizer = optim.Adam([model.delta_fc1_weight], lr=model.learning_rate)
+    start = time.time()
+    model.train()
+
+    for epoch in range(model.max_iter):
+        epoch_loss = 0.0
+        batches = 0
+        for X_b, y_b, _ in loader:
+            X_b, y_b = X_b.to(device), y_b.to(device)
+            pred = model(X_b)
+            loss = model.criterion(pred, y_b).mean()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            batches += 1
+
+        if (epoch + 1) % 5 == 0:
+            print(f"[Client {rank}] Epoch {epoch+1}/{model.max_iter}  "
+                  f"Loss={epoch_loss / max(batches, 1):.4f}")
+
+    elapsed = time.time() - start
+    print(f"[Client {rank}] Training done in {elapsed:.2f}s")
+    return elapsed
+
+
 def evaluate(model, test_loader, device):
     model.eval()
     total = correct = 0
@@ -773,6 +1026,78 @@ def aggregate_metrics(current_folder_path):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def run_federated_multithread(
+    rank, world_size, model_class, baseline_state,
+    X_train, X_test, y_train, y_test,
+    X_clients, y_clients, yes_no_counts, partition_details,
+    results_dir, model_path, time_file, log_file,
+    base_dir, prep_name, new_feature_indices,
+):
+    """Federated P' = P + Delta P training on the expanded dataset only."""
+    setup_multithread(rank, world_size)
+    device = torch.device("cpu")
+    model = model_class(
+        baseline_state, X_train.shape[1], new_feature_indices
+    ).to(device)
+    loaders = get_data_loaders(X_clients, y_clients)
+    optimizer = optim.Adam([model.delta_fc1_weight], lr=model.learning_rate)
+
+    if rank == 0:
+        test_loader = DataLoader(
+            TensorDataset(X_test, y_test), batch_size=32, shuffle=False
+        )
+        test_yes_no = (
+            (y_test == 1).sum().item(), (y_test == 0).sum().item()
+        )
+        log_initial_details(
+            "ArtificialNeuralNetwork", world_size, X_clients,
+            len(X_train), len(X_test), yes_no_counts, test_yes_no,
+            partition_details, log_file,
+        )
+
+    fed_rounds = 50
+    model_name = "ArtificialNeuralNetwork"
+    start = time.time()
+    total_inf_t = []
+    acc = prec = rec = f1 = 0.0
+
+    for r in range(fed_rounds):
+        if rank == 0:
+            print(f"[MT] Round {r+1}/{fed_rounds}")
+        train_time = train_local(rank, model, loaders[rank], device, optimizer)
+        aggregate_multithread(model, world_size)
+
+        if rank == 0:
+            acc, prec, rec, f1, inf_t = evaluate(model, test_loader, device)
+            total_inf_t.extend(inf_t)
+            save_round_result(model_name, acc, prec, rec, f1, results_dir)
+            with open(log_file, "a") as lf:
+                lf.write(
+                    f"Round {r+1}  TrainTime={train_time:.4f}s  "
+                    f"AvgInference={np.mean(inf_t):.10f}s\n"
+                )
+
+    total_train_time = time.time() - start
+    save_training_time("ArtificialNeuralNetwork", rank, total_train_time, time_file)
+
+    if rank == 0:
+        os.makedirs(model_path, exist_ok=True)
+        save_path = os.path.join(
+            model_path, f"{model_name}_feat_incr_final.pth"
+        )
+        torch.save(model.merged_state_dict(), save_path)
+        print(f"[INFO] Feat. Incr. Model saved -> {save_path}")
+        avg_inf_ms = np.mean(total_inf_t) * 1000 if total_inf_t else 0.0
+        save_consolidated_result(
+            base_dir, ALGO, prep_name, model_name,
+            acc, prec, rec, f1, total_train_time, avg_inf_ms,
+            int(len(X_train)), int(len(X_test)),
+        )
+
+    cleanup()
+
+
+# Legacy two-model implementation retained below for the multimachine path.
+def run_federated_multithread_multimachine_legacy(
     rank, world_size, model_class,
 
     # Old feature set
@@ -853,12 +1178,12 @@ def run_federated_multithread(
         if rank == 0:
             print(f"[MT] Round {r+1}/{fed_rounds}")
 
-        train_time = train_local(
+        train_time = train_local_multimachine_legacy(
             rank, prev_model, prev_loaders[rank], curr_model, curr_loaders[rank],
             device, old_feature_indices,
         )
-        aggregate_multithread(prev_model, world_size)
-        aggregate_multithread(curr_model, world_size)
+        aggregate_multithread_multimachine_legacy(prev_model, world_size)
+        aggregate_multithread_multimachine_legacy(curr_model, world_size)
 
         # --------------------------------------------------------
         # Evaluate the CURRENT feature-set model
@@ -896,7 +1221,7 @@ def run_federated_multithread(
     cleanup()
 
 
-def main(prep_type):
+def main_legacy(prep_type):
     prep_names = {2: "ARFE", 3: "AVC", 4: "ARFE_AVC", 5: "NaiveNA"}
     prep_name  = prep_names.get(prep_type, f"Prep{prep_type}")
 
@@ -1027,10 +1352,90 @@ def main(prep_type):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# New feature-incremental entry point: expanded data + baseline checkpoint.
+def main(prep_type):
+    prep_names = {2: "ARFE", 3: "AVC", 4: "ARFE_AVC", 5: "NaiveNA"}
+    prep_name = prep_names.get(prep_type, f"Prep{prep_type}")
+    seed = 0
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    results_dir = os.path.join(
+        base_dir, "Results", "feat-incr", "Company", ALGO,
+        prep_name, f"Seed_{seed}"
+    )
+    model_path = os.path.join(base_dir, "Model", "feat-incr", prep_name)
+    os.makedirs(results_dir, exist_ok=True)
+    os.makedirs(model_path, exist_ok=True)
+    time_file = os.path.join(results_dir, "train_times.csv")
+    log_file = os.path.join(results_dir, "training_log.txt")
+    initialize_time_file(time_file)
+
+    # Load the old files only to reproduce the baseline encoding and validate
+    # the old processed schema. They are not used as training examples.
+    old_train_data = pd.read_csv(os.path.join(base_dir, "Dataset", "train_company.csv"))
+    old_test_data = pd.read_csv(os.path.join(base_dir, "Dataset", "test_company.csv"))
+    train_data = pd.read_csv(os.path.join(base_dir, "Dataset", "new_train_company.csv"))
+    test_data = pd.read_csv(os.path.join(base_dir, "Dataset", "new_test_company.csv"))
+    mapping_type = 1 if prep_type in (1, 2, 5) else 2
+    baseline_mapping = GetBaselineAttributeMapping(
+        pd.concat([old_train_data, old_test_data], axis=0),
+        grp=attr_grp, map_type=mapping_type,
+    )
+    X_old, _, _, _, _ = GetPreparedData(
+        old_train_data, old_test_data, prep_type=prep_type, seed=seed,
+        prep_name=prep_name, mapping=baseline_mapping,
+        uniform_mapping=True,
+    )
+    X_train, X_test, y_train, y_test, _ = GetPreparedData(
+        train_data, test_data, prep_type=prep_type, seed=seed,
+        prep_name=prep_name, mapping=baseline_mapping,
+        uniform_mapping=True,
+        new_feature_names=NEW_FEATURE_NAMES,
+    )
+
+    checkpoint_path = os.path.join(
+        base_dir, "Model", "old", "PBP", prep_name,
+        "ArtificialNeuralNetwork_final.pth",
+    )
+    baseline_state = load_baseline_state(checkpoint_path)
+    old_input_dim = baseline_state["fc1.weight"].shape[1]
+    old_feature_indices, new_feature_indices = resolve_checkpoint_feature_indices(
+        X_train.columns, X_old.columns, old_input_dim
+    )
+    print(
+        f"[INFO] Baseline={checkpoint_path} | old_features={old_input_dim} | "
+        f"expanded_features={X_train.shape[1]} | "
+        f"new_positions={new_feature_indices}"
+    )
+
+    X_train_t = torch.tensor(X_train.values, dtype=torch.float32)
+    X_test_t = torch.tensor(X_test.values, dtype=torch.float32)
+    y_train_t = torch.tensor(y_train.values, dtype=torch.float32).view(-1, 1)
+    y_test_t = torch.tensor(y_test.values, dtype=torch.float32).view(-1, 1)
+    np.random.seed(seed)
+    best_index, best_name = resolve_best_feature(X_train.columns)
+    X_clients, y_clients, yes_no_counts, partition_details, _ = partition_dataset(
+        X_train_t, y_train_t, best_index, best_name, N_CLIENTS
+    )
+
+    torch.multiprocessing.spawn(
+        run_federated_multithread,
+        args=(
+            N_CLIENTS, DeltaFeatureANN, baseline_state,
+            X_train_t, X_test_t, y_train_t, y_test_t,
+            X_clients, y_clients, yes_no_counts, partition_details,
+            results_dir, model_path, time_file, log_file,
+            base_dir, prep_name, new_feature_indices,
+        ),
+        nprocs=N_CLIENTS, join=True, start_method="spawn",
+    )
+    aggregate_metrics(os.path.dirname(results_dir))
+
+
 #  PREP  mode
 # ═══════════════════════════════════════════════════════════════════════════════
 ### Unmodified for now
-def run_prep(prep_type):
+def run_prep_legacy(prep_type):
     """Prepare and persist old/current tensors for multimachine training."""
     prep_names = {2: "ARFE", 3: "AVC", 4: "ARFE_AVC", 5: "NaiveNA"}
     prep_name  = prep_names.get(prep_type, f"Prep{prep_type}")
@@ -1116,11 +1521,71 @@ def run_prep(prep_type):
           f"--prep_type {prep_type} --rank <R> --master_addr <IP>")
 
 
+# New multimachine preparation: persist only the expanded dataset.
+def run_prep(prep_type):
+    prep_names = {2: "ARFE", 3: "AVC", 4: "ARFE_AVC", 5: "NaiveNA"}
+    prep_name = prep_names.get(prep_type, f"Prep{prep_type}")
+    seed = 0
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    tensor_dir = os.path.join(base_dir, "Tensors", ALGO, prep_name)
+    os.makedirs(tensor_dir, exist_ok=True)
+
+    old_train = pd.read_csv(os.path.join(base_dir, "Dataset", "train_company.csv"))
+    old_test = pd.read_csv(os.path.join(base_dir, "Dataset", "test_company.csv"))
+    train = pd.read_csv(os.path.join(base_dir, "Dataset", "new_train_company.csv"))
+    test = pd.read_csv(os.path.join(base_dir, "Dataset", "new_test_company.csv"))
+    mapping_type = 1 if prep_type in (1, 2, 5) else 2
+    baseline_mapping = GetBaselineAttributeMapping(
+        pd.concat([old_train, old_test]), grp=attr_grp, map_type=mapping_type
+    )
+    X_old, _, _, _, _ = GetPreparedData(
+        old_train, old_test, prep_type=prep_type, seed=seed,
+        prep_name=prep_name, mapping=baseline_mapping, uniform_mapping=True,
+    )
+    X_train, X_test, y_train, y_test, _ = GetPreparedData(
+        train, test, prep_type=prep_type, seed=seed,
+        prep_name=prep_name, mapping=baseline_mapping,
+        uniform_mapping=True, new_feature_names=NEW_FEATURE_NAMES,
+    )
+    checkpoint_path = os.path.join(
+        base_dir, "Model", "old", "PBP", prep_name,
+        "ArtificialNeuralNetwork_final.pth",
+    )
+    baseline_state = load_baseline_state(checkpoint_path)
+    old_input_dim = baseline_state["fc1.weight"].shape[1]
+    old_indices, new_indices = resolve_checkpoint_feature_indices(
+        X_train.columns, X_old.columns, old_input_dim
+    )
+
+    X_train_t = torch.tensor(X_train.values, dtype=torch.float32)
+    X_test_t = torch.tensor(X_test.values, dtype=torch.float32)
+    y_train_t = torch.tensor(y_train.values, dtype=torch.float32).view(-1, 1)
+    y_test_t = torch.tensor(y_test.values, dtype=torch.float32).view(-1, 1)
+    np.random.seed(seed)
+    best_index, best_name = resolve_best_feature(X_train.columns)
+    clients = partition_dataset(
+        X_train_t, y_train_t, best_index, best_name, N_CLIENTS
+    )
+    X_clients, y_clients = clients[0], clients[1]
+    for i in range(N_CLIENTS):
+        torch.save(X_clients[i], os.path.join(tensor_dir, f"client_{i+1}_X.pt"))
+        torch.save(y_clients[i], os.path.join(tensor_dir, f"client_{i+1}_y.pt"))
+    torch.save(X_test_t, os.path.join(tensor_dir, "test_X.pt"))
+    torch.save(y_test_t, os.path.join(tensor_dir, "test_y.pt"))
+    torch.save({
+        "old_feature_indices": old_indices,
+        "new_feature_indices": new_indices,
+        "input_dim": X_train.shape[1],
+    }, os.path.join(tensor_dir, "feature_indices.pt"))
+    print(f"[PREP] Expanded features: {X_train.shape[1]}")
+    print(f"[PREP] Tensors saved -> {tensor_dir}")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  MULTIMACHINE  mode
 # ═══════════════════════════════════════════════════════════════════════════════
 ### Unmodified for now
-def run_federated_multimachine(rank, world_size, prep_type, prep_name,
+def run_federated_multimachine_legacy(rank, world_size, prep_type, prep_name,
                                master_addr, master_port, base_dir):
     """
     Each physical VM runs this with its assigned rank.
@@ -1214,7 +1679,7 @@ def run_federated_multimachine(rank, world_size, prep_type, prep_name,
             print(f"[Client {rank}] Training round {r+1}/{fed_rounds}")
 
         if rank != 0:
-            train_local(
+            train_local_multimachine_legacy(
                 rank, prev_model, prev_loader, curr_model, curr_loader, device,
                 old_feature_indices,
             )
@@ -1250,6 +1715,102 @@ def run_federated_multimachine(rank, world_size, prep_type, prep_name,
             -1, int(n_test),
         )
 
+    cleanup()
+
+
+def run_federated_multimachine(rank, world_size, prep_type, prep_name,
+                               master_addr, master_port, base_dir):
+    """Run the same P' = P + Delta P method across physical machines."""
+    setup_multimachine(rank, world_size, master_addr, master_port)
+    device = torch.device("cpu")
+    tensor_dir = os.path.join(base_dir, "Tensors", ALGO, prep_name)
+    results_dir = os.path.join(
+        base_dir, "Results", "feat-incr", "Company", ALGO,
+        prep_name, "Seed_0"
+    )
+    model_path = os.path.join(base_dir, "Model", "feat-incr", prep_name)
+    log_file = os.path.join(results_dir, "training_log_mm.txt")
+    time_file = os.path.join(results_dir, "train_times_mm.csv")
+
+    feature_indices = torch.load(
+        os.path.join(tensor_dir, "feature_indices.pt"), map_location="cpu"
+    )
+    new_feature_indices = feature_indices["new_feature_indices"]
+    checkpoint_path = os.path.join(
+        base_dir, "Model", "old", "PBP", prep_name,
+        "ArtificialNeuralNetwork_final.pth",
+    )
+    baseline_state = load_baseline_state(checkpoint_path)
+
+    if rank == 0:
+        os.makedirs(results_dir, exist_ok=True)
+        os.makedirs(model_path, exist_ok=True)
+        initialize_time_file(time_file)
+        X_test = torch.load(os.path.join(tensor_dir, "test_X.pt"), map_location="cpu")
+        y_test = torch.load(os.path.join(tensor_dir, "test_y.pt"), map_location="cpu")
+        test_loader = DataLoader(
+            TensorDataset(X_test, y_test), batch_size=32, shuffle=False
+        )
+        input_dim = X_test.shape[1]
+        n_test = len(X_test)
+        print(f"[Server rank=0] Expanded features: {input_dim} | test={n_test}")
+    else:
+        X_client = torch.load(
+            os.path.join(tensor_dir, f"client_{rank}_X.pt"), map_location="cpu"
+        )
+        y_client = torch.load(
+            os.path.join(tensor_dir, f"client_{rank}_y.pt"), map_location="cpu"
+        )
+        client_loader = DataLoader(
+            TensorDataset(X_client, y_client, torch.arange(len(X_client))),
+            batch_size=32, shuffle=True,
+        )
+        input_dim = X_client.shape[1]
+        print(f"[Client rank={rank}] Expanded records: {len(X_client)}")
+
+    model = DeltaFeatureANN(
+        baseline_state, input_dim, new_feature_indices
+    ).to(device)
+    optimizer = optim.Adam([model.delta_fc1_weight], lr=model.learning_rate)
+    fed_rounds = 50
+    start = time.time()
+    total_inf_t = []
+    acc = prec = rec = f1 = 0.0
+
+    for round_number in range(fed_rounds):
+        if rank == 0:
+            print(f"[MM] Round {round_number + 1}/{fed_rounds}")
+        else:
+            train_local(rank, model, client_loader, device, optimizer)
+
+        aggregate_multimachine_delta(rank, model, n_clients=N_CLIENTS)
+
+        if rank == 0:
+            acc, prec, rec, f1, inf_t = evaluate(model, test_loader, device)
+            total_inf_t.extend(inf_t)
+            save_round_result(
+                "ArtificialNeuralNetwork", acc, prec, rec, f1, results_dir
+            )
+            with open(log_file, "a") as log:
+                log.write(
+                    f"Round {round_number + 1}  "
+                    f"AvgInference={np.mean(inf_t):.10f}s\n"
+                )
+
+    total_train_time = time.time() - start
+    save_training_time("ArtificialNeuralNetwork", rank, total_train_time, time_file)
+    if rank == 0:
+        save_path = os.path.join(
+            model_path, "ArtificialNeuralNetwork_feat_incr_final.pth"
+        )
+        torch.save(model.merged_state_dict(), save_path)
+        print(f"[Server] Model saved -> {save_path}")
+        avg_inf_ms = np.mean(total_inf_t) * 1000 if total_inf_t else 0.0
+        save_consolidated_result(
+            base_dir, ALGO, prep_name, "ArtificialNeuralNetwork",
+            acc, prec, rec, f1, total_train_time, avg_inf_ms,
+            -1, int(n_test),
+        )
     cleanup()
 
 
