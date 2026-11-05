@@ -179,75 +179,49 @@ def load_baseline_state(checkpoint_path):
 # ─── Model definitions ────────────────────────────────────────────────────────
 
 class ArtificialNeuralNetwork(nn.Module):
-    """Expanded ANN with only the new-feature first-layer connections trainable.
+    """ANN used for either the frozen baseline or expanded current model."""
 
-    ``fc1`` and ``fc2`` contain the frozen baseline model.  The trainable
-    parameter is an explicit delta for the columns identified by
-    ``new_feature_indices``.  This avoids trying to freeze individual slices of
-    a single PyTorch Parameter.
-    """
-
-    def __init__(self, baseline_state, input_dim, new_feature_indices,
+    def __init__(self, input_dim, baseline_state=None,
+                 old_feature_indices=None, hidden_layer_size=64,
                  learning_rate=0.001, max_iter=200):
         super().__init__()
-        old_weight = baseline_state["fc1.weight"]
-        hidden_size, old_input_dim = old_weight.shape
-        if len(new_feature_indices) + old_input_dim != input_dim:
-            raise ValueError(
-                f"Checkpoint input width is {old_input_dim}, expanded data "
-                f"width is {input_dim}, and {len(new_feature_indices)} new "
-                "feature columns were identified."
-            )
-
         self.input_dim = input_dim
-        self.hidden_layer_size = hidden_size
         self.learning_rate = learning_rate
         self.max_iter = max_iter
         self.criterion = nn.BCELoss(reduction="none")
-        self.new_feature_indices = torch.tensor(
-            list(new_feature_indices), dtype=torch.long
-        )
+        self.fc1 = nn.Linear(input_dim, hidden_layer_size)
+        self.fc2 = nn.Linear(hidden_layer_size, 1)
+        self.hidden_layer_size = self.fc1.out_features
 
-        self.fc1 = nn.Linear(input_dim, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, 1)
-        expanded_weight = torch.zeros(
-            hidden_size, input_dim, dtype=old_weight.dtype
-        )
-        old_indices = [i for i in range(input_dim)
-                       if i not in set(new_feature_indices)]
-        expanded_weight[:, old_indices] = old_weight
-        self.fc1.weight.data.copy_(expanded_weight)
-        self.fc1.bias.data.copy_(baseline_state["fc1.bias"])
-        self.fc2.weight.data.copy_(baseline_state["fc2.weight"])
-        self.fc2.bias.data.copy_(baseline_state["fc2.bias"])
-
-        for parameter in self.fc1.parameters():
-            parameter.requires_grad = False
-        for parameter in self.fc2.parameters():
-            parameter.requires_grad = False
-
-        self.delta_fc1_weight = nn.Parameter(
-            torch.zeros(hidden_size, len(new_feature_indices),
-                        dtype=old_weight.dtype)
-        )
+        if baseline_state is not None:
+            if old_feature_indices is None:
+                raise ValueError(
+                    "old_feature_indices are required for the expanded model"
+                )
+            old_indices = list(old_feature_indices)
+            old_weight = baseline_state["fc1.weight"]
+            if len(old_indices) != old_weight.shape[1]:
+                raise ValueError(
+                    "The expanded old-feature positions do not match the "
+                    "baseline checkpoint width."
+                )
+            # Copy only the old-feature columns.  The new columns retain the
+            # normal nn.Linear initialization for the current model.
+            with torch.no_grad():
+                self.fc1.weight[:, old_indices] = old_weight
+                self.fc1.bias.copy_(baseline_state["fc1.bias"])
+                self.fc2.weight.copy_(baseline_state["fc2.weight"])
+                self.fc2.bias.copy_(baseline_state["fc2.bias"])
 
     def forward(self, x):
-        delta_x = x.index_select(1, self.new_feature_indices.to(x.device))
-        hidden = F.linear(x, self.fc1.weight, self.fc1.bias)
-        hidden = hidden + F.linear(delta_x, self.delta_fc1_weight)
-        return torch.sigmoid(self.fc2(torch.relu(hidden)))
+        return torch.sigmoid(self.fc2(torch.relu(self.fc1(x))))
 
     def merged_state_dict(self):
-        """Return a normal ANN state_dict representing P' = P + Delta P."""
-        state = {
-            "fc1.weight": self.fc1.weight.detach().clone(),
-            "fc1.bias": self.fc1.bias.detach().clone(),
-            "fc2.weight": self.fc2.weight.detach().clone(),
-            "fc2.bias": self.fc2.bias.detach().clone(),
+        """Return the expanded current model as a normal ANN checkpoint."""
+        return {
+            key: value.detach().clone()
+            for key, value in self.state_dict().items()
         }
-        indices = self.new_feature_indices.tolist()
-        state["fc1.weight"][:, indices] += self.delta_fc1_weight.detach()
-        return state
 
 
 # ─── ABAC attribute groups ────────────────────────────────────────────────────
@@ -314,20 +288,21 @@ def cleanup():
 # ─── Weight aggregation ───────────────────────────────────────────────────────
 
 def aggregate_multithread(model, world_size):
-    """FedAvg only Delta P; frozen baseline parameters are not reduced."""
-    dist.all_reduce(model.delta_fc1_weight.data, op=dist.ReduceOp.SUM)
-    model.delta_fc1_weight.data /= world_size
+    """FedAvg the current expanded model across the client processes."""
+    for parameter in model.parameters():
+        dist.all_reduce(parameter.data, op=dist.ReduceOp.SUM)
+        parameter.data /= world_size
 
 
-def aggregate_multimachine_delta(rank, model, n_clients=N_CLIENTS):
-    """FedAvg only Delta P for the server-plus-client multimachine layout."""
-    delta = model.delta_fc1_weight.data
-    if rank == 0:
-        delta.zero_()
-    dist.reduce(delta, dst=0, op=dist.ReduceOp.SUM)
-    if rank == 0:
-        delta /= n_clients
-    dist.broadcast(delta, src=0)
+def aggregate_multimachine(rank, model, n_clients=N_CLIENTS):
+    """FedAvg the current expanded model across physical machines."""
+    for parameter in model.parameters():
+        if rank == 0:
+            parameter.data.zero_()
+        dist.reduce(parameter.data, dst=0, op=dist.ReduceOp.SUM)
+        if rank == 0:
+            parameter.data /= n_clients
+        dist.broadcast(parameter.data, src=0)
 
 
 # ─── Attribute mapping helpers ────────────────────────────────────────────────
@@ -612,29 +587,160 @@ def get_data_loaders(X_clients, y_clients, batch_size=32):
 
 
 # Balancing regulariser
-def train_local(rank, model, loader, device, optimizer=None):
-    """Train only Delta P on the expanded labelled dataset."""
-    if optimizer is None:
-        optimizer = optim.Adam([model.delta_fc1_weight], lr=model.learning_rate)
-    start = time.time()
-    model.train()
+def calculating_balancing_regulariser(X, u):
+    """
+    Calculate the balancing regularizer Phi_u(X) from Eq. (7) of Ni et al.
 
-    for epoch in range(model.max_iter):
+    Every distinct encoded value is treated as a category.  For each feature
+    and category, the weighted first moments of all remaining features are
+    matched between the category and its complement.
+    """
+    n_samples, n_features = X.shape
+    total_bal = torch.tensor(0.0, device=X.device, dtype=X.dtype)
+    eps = 1e-8
+
+    for j in range(n_features):
+        # Treatment feature X_j
+        X_j = X[:, j]
+
+        categories = torch.unique(X_j)
+        # remaining features X_(-j)
+        remaining_mask = torch.ones(
+            n_features, device=X.device, dtype=torch.bool
+        )
+        remaining_mask[j] = False
+        X_remaining = X[:, remaining_mask]
+
+        for category in categories:
+            # Binary treatment indicator for this category.
+            treatment = (X_j == category).to(X.dtype)
+
+            # Everything not belonging to this category is control.
+            control = (X_j != category).to(X.dtype)
+
+            # Weighted sizes of treatment and control groups.
+            treatment_mass = torch.sum(u * treatment)
+            control_mass = torch.sum(u * control)
+
+            # Skip if one of the groups has zero weighted mass.
+            if treatment_mass <= eps or control_mass <= eps:
+                continue
+
+            # Normalized weighted treatment/control sample weights.
+            # T_j = u ⊙ X_j / u^T X_j
+            # C_j = u ⊙ (1 - X_j) / u^T (1 - X_j)
+            treatment_weights = u * treatment / (treatment_mass + eps)
+            control_weights = u * control / (control_mass + eps)
+            treatment_moments = X_remaining.T @ treatment_weights
+            control_moments = X_remaining.T @ control_weights
+            total_bal += torch.sum(
+                (treatment_moments - control_moments) ** 2
+            )
+
+    return total_bal
+
+
+def model_wt_regulariser(model):
+    """L2 penalty on the model parameters."""
+    return sum(
+        torch.sum(parameter ** 2) for parameter in model.parameters()
+    )
+
+
+def model_consistency_regulariser(baseline_model, current_model,
+                                  old_feature_indices):
+    """Match current-model old-feature weights to the frozen baseline."""
+    old_indices = torch.as_tensor(
+        old_feature_indices, dtype=torch.long,
+        device=current_model.fc1.weight.device,
+    )
+    baseline_weight = baseline_model.fc1.weight.detach()
+    return torch.sum(
+        (baseline_weight - current_model.fc1.weight[:, old_indices]) ** 2
+    )
+
+
+def train_local(rank, baseline_model, current_model, loader, device,
+                old_feature_indices, optimizer=None):
+    """Alternately optimize current-model weights and expanded-data weights."""
+    if optimizer is None:
+        optimizer = optim.Adam(
+            current_model.parameters(), lr=current_model.learning_rate
+        )
+
+    n_samples = len(loader.dataset)
+    v = nn.Parameter(
+        torch.full(
+            (n_samples,), 1.0 / math.sqrt(n_samples), device=device
+        )
+    )
+    weight_optimizer = optim.Adam([v], lr=current_model.learning_rate)
+    start = time.time()
+    baseline_model.eval()
+    current_model.train()
+
+    for epoch in range(current_model.max_iter):
         epoch_loss = 0.0
         batches = 0
-        for X_b, y_b, _ in loader:
-            X_b, y_b = X_b.to(device), y_b.to(device)
-            pred = model(X_b)
-            loss = model.criterion(pred, y_b).mean()
+
+        # Update current-model parameters with u fixed.
+        u = (v * v).detach()
+        for X_b, y_b, i_b in loader:
+            X_b, y_b, i_b = (
+                X_b.to(device), y_b.to(device), i_b.to(device)
+            )
+            u_b = u[i_b]
+            prediction_loss = torch.sum(
+                u_b * current_model.criterion(current_model(X_b), y_b).view(-1)
+            )
+            consistency_reg = LAMBDA_CON * model_consistency_regulariser(
+                baseline_model, current_model, old_feature_indices
+            )
+            model_reg = LAMBDA_W * model_wt_regulariser(current_model)
+            loss = prediction_loss + consistency_reg + model_reg
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
             batches += 1
 
+        # Update u=v*v with current-model parameters fixed.
+        for X_b, y_b, i_b in loader:
+            X_b, y_b, i_b = (
+                X_b.to(device), y_b.to(device), i_b.to(device)
+            )
+            u = v * v
+            u_b = u[i_b]
+            with torch.no_grad():
+                bce = current_model.criterion(
+                    current_model(X_b), y_b
+                ).view(-1)
+
+            prediction_loss = torch.sum(u_b * bce)
+            balancing_reg = LAMBDA_BAL * calculating_balancing_regulariser(
+                X_b, u_b
+            )
+            sample_weight_reg = LAMBDA_U * torch.sum(u ** 2)
+            sample_weight_norm = LAMBDA_U_NORM * (
+                torch.sum(u) - 1.0
+            ) ** 2
+            loss = (
+                prediction_loss
+                + balancing_reg
+                + sample_weight_reg
+                + sample_weight_norm
+            )
+
+            weight_optimizer.zero_grad()
+            loss.backward()
+            weight_optimizer.step()
+
         if (epoch + 1) % 5 == 0:
-            print(f"[Client {rank}] Epoch {epoch+1}/{model.max_iter}  "
-                  f"Loss={epoch_loss / max(batches, 1):.4f}")
+            print(
+                f"[Client {rank}] Epoch {epoch+1}/{current_model.max_iter}  "
+                f"Loss={epoch_loss / max(batches, 1):.4f}"
+            )
 
     elapsed = time.time() - start
     print(f"[Client {rank}] Training done in {elapsed:.2f}s")
@@ -764,16 +870,23 @@ def run_federated_multithread(
     X_train, X_test, y_train, y_test,
     X_clients, y_clients, yes_no_counts, partition_details,
     results_dir, model_path, time_file, log_file,
-    base_dir, prep_name, new_feature_indices,
+    base_dir, prep_name, old_feature_indices,
 ):
     """Federated P' = P + Delta P training on the expanded dataset only."""
     setup_multithread(rank, world_size)
     device = torch.device("cpu")
-    model = model_class(
-        baseline_state, X_train.shape[1], new_feature_indices
+    old_input_dim = baseline_state["fc1.weight"].shape[1]
+    baseline_model = model_class(old_input_dim).to(device)
+    baseline_model.load_state_dict(baseline_state)
+    for parameter in baseline_model.parameters():
+        parameter.requires_grad = False
+    current_model = model_class(
+        X_train.shape[1], baseline_state, old_feature_indices
     ).to(device)
     loaders = get_data_loaders(X_clients, y_clients)
-    optimizer = optim.Adam([model.delta_fc1_weight], lr=model.learning_rate)
+    optimizer = optim.Adam(
+        current_model.parameters(), lr=current_model.learning_rate
+    )
 
     if rank == 0:
         test_loader = DataLoader(
@@ -797,11 +910,16 @@ def run_federated_multithread(
     for r in range(fed_rounds):
         if rank == 0:
             print(f"[MT] Round {r+1}/{fed_rounds}")
-        train_time = train_local(rank, model, loaders[rank], device, optimizer)
-        aggregate_multithread(model, world_size)
+        train_time = train_local(
+            rank, baseline_model, current_model, loaders[rank], device,
+            old_feature_indices, optimizer
+        )
+        aggregate_multithread(current_model, world_size)
 
         if rank == 0:
-            acc, prec, rec, f1, inf_t = evaluate(model, test_loader, device)
+            acc, prec, rec, f1, inf_t = evaluate(
+                current_model, test_loader, device
+            )
             total_inf_t.extend(inf_t)
             save_round_result(model_name, acc, prec, rec, f1, results_dir)
             with open(log_file, "a") as lf:
@@ -818,7 +936,7 @@ def run_federated_multithread(
         save_path = os.path.join(
             model_path, f"{model_name}_feat_incr_final.pth"
         )
-        torch.save(model.merged_state_dict(), save_path)
+        torch.save(current_model.merged_state_dict(), save_path)
         print(f"[INFO] Feat. Incr. Model saved -> {save_path}")
         avg_inf_ms = np.mean(total_inf_t) * 1000 if total_inf_t else 0.0
         save_consolidated_result(
@@ -903,7 +1021,7 @@ def main(prep_type):
             X_train_t, X_test_t, y_train_t, y_test_t,
             X_clients, y_clients, yes_no_counts, partition_details,
             results_dir, model_path, time_file, log_file,
-            base_dir, prep_name, new_feature_indices,
+            base_dir, prep_name, old_feature_indices,
         ),
         nprocs=N_CLIENTS, join=True, start_method="spawn",
     )
@@ -993,7 +1111,7 @@ def run_federated_multimachine(rank, world_size, prep_type, prep_name,
     feature_indices = torch.load(
         os.path.join(tensor_dir, "feature_indices.pt"), map_location="cpu"
     )
-    new_feature_indices = feature_indices["new_feature_indices"]
+    old_feature_indices = feature_indices["old_feature_indices"]
     checkpoint_path = os.path.join(
         base_dir, "Model", "old", "PBP", prep_name,
         "ArtificialNeuralNetwork_final.pth",
@@ -1026,10 +1144,17 @@ def run_federated_multimachine(rank, world_size, prep_type, prep_name,
         input_dim = X_client.shape[1]
         print(f"[Client rank={rank}] Expanded records: {len(X_client)}")
 
-    model = ArtificialNeuralNetwork(
-        baseline_state, input_dim, new_feature_indices
+    old_input_dim = baseline_state["fc1.weight"].shape[1]
+    baseline_model = ArtificialNeuralNetwork(old_input_dim).to(device)
+    baseline_model.load_state_dict(baseline_state)
+    for parameter in baseline_model.parameters():
+        parameter.requires_grad = False
+    current_model = ArtificialNeuralNetwork(
+        input_dim, baseline_state, old_feature_indices
     ).to(device)
-    optimizer = optim.Adam([model.delta_fc1_weight], lr=model.learning_rate)
+    optimizer = optim.Adam(
+        current_model.parameters(), lr=current_model.learning_rate
+    )
     fed_rounds = 50
     start = time.time()
     total_inf_t = []
@@ -1039,12 +1164,17 @@ def run_federated_multimachine(rank, world_size, prep_type, prep_name,
         if rank == 0:
             print(f"[MM] Round {round_number + 1}/{fed_rounds}")
         else:
-            train_local(rank, model, client_loader, device, optimizer)
+            train_local(
+                rank, baseline_model, current_model, client_loader, device,
+                old_feature_indices, optimizer
+            )
 
-        aggregate_multimachine_delta(rank, model, n_clients=N_CLIENTS)
+        aggregate_multimachine(rank, current_model, n_clients=N_CLIENTS)
 
         if rank == 0:
-            acc, prec, rec, f1, inf_t = evaluate(model, test_loader, device)
+            acc, prec, rec, f1, inf_t = evaluate(
+                current_model, test_loader, device
+            )
             total_inf_t.extend(inf_t)
             save_round_result(
                 "ArtificialNeuralNetwork", acc, prec, rec, f1, results_dir
@@ -1061,7 +1191,7 @@ def run_federated_multimachine(rank, world_size, prep_type, prep_name,
         save_path = os.path.join(
             model_path, "ArtificialNeuralNetwork_feat_incr_final.pth"
         )
-        torch.save(model.merged_state_dict(), save_path)
+        torch.save(current_model.merged_state_dict(), save_path)
         print(f"[Server] Model saved -> {save_path}")
         avg_inf_ms = np.mean(total_inf_t) * 1000 if total_inf_t else 0.0
         save_consolidated_result(
