@@ -79,7 +79,7 @@ MT_PORT       = 7777   # localhost port for multithread TCPStore
 # when some columns are dropped.  Switch to "Department" if your perception
 # feature is the subject department instead of designation.
 BEST_FEATURE_NAME = "DESIGNATION"   # Subject Designation (reference perception)
-
+NEW_FEATURE_NAMES = {"WORK_LOCATION"}
 
 def resolve_best_feature(columns):
     """Return (index, name) of the perception feature within the encoded X."""
@@ -495,12 +495,12 @@ def log_initial_details(model_name, world_size, X_clients,
                 f"{partition_details.get('best_feature', 'N/A')}\n\n")
 
 
-def aggregate_metrics(current_folder_path):
-    results_dir = os.path.join(current_folder_path, "Final")
+def aggregate_metrics(base_dir):
+    results_dir = os.path.join(base_dir, "Final")
     os.makedirs(results_dir, exist_ok=True)
     results = []
-    for sf in os.listdir(current_folder_path):
-        path = os.path.join(current_folder_path, sf, "results.csv")
+    for sf in os.listdir(base_dir):
+        path = os.path.join(base_dir, sf, "results.csv")
         if os.path.isfile(path):
             df   = pd.read_csv(path)
             last = df.tail(1).copy()
@@ -597,11 +597,11 @@ def main(prep_type):
         print(f"{'='*60}")
         np.random.seed(seed)
 
-        base_dir = current_folder_path = os.path.dirname(os.path.abspath(__file__))
+        base_dir = os.path.dirname(os.path.abspath(__file__))
 
-        results_dir     = os.path.join(current_folder_path, RESULTS_ROOT, "Company",
+        results_dir     = os.path.join(base_dir, RESULTS_ROOT, "Company",
                                        ALGO, prep_name, f"Seed_{seed}")
-        model_path      = os.path.join(current_folder_path, MODEL_ROOT, ALGO, prep_name)
+        model_path      = os.path.join(base_dir, MODEL_ROOT, ALGO, prep_name)
         os.makedirs(results_dir,     exist_ok=True)
         os.makedirs(model_path,      exist_ok=True)
 
@@ -609,10 +609,25 @@ def main(prep_type):
         log_file  = os.path.join(results_dir, "training_log.txt")
         initialize_time_file(time_file)
 
-        train_data = pd.read_csv(os.path.join(current_folder_path, "Dataset",
-                                              "new_train_company.csv"))
-        test_data  = pd.read_csv(os.path.join(current_folder_path, "Dataset",
-                                              "new_test_company.csv"))
+        old_train_data = pd.read_csv(os.path.join(base_dir, "Dataset", "train_company.csv"))
+        old_test_data  = pd.read_csv(os.path.join(base_dir, "Dataset", "test_company.csv"))
+        new_train_data = pd.read_csv(os.path.join(base_dir, "Dataset", "new_train_company.csv"))
+        new_test_data  = pd.read_csv(os.path.join(base_dir, "Dataset", "new_test_company.csv"))
+
+        # concatenate and set new feature as NotA in old dataframe
+        feat_name = next(iter(NEW_FEATURE_NAMES))
+        feat_pos = new_train_data.columns.get_loc(feat_name)
+
+        for df in (old_train_data, old_test_data):
+            df.insert(feat_pos, feat_name, "NotA")
+
+        train_data = pd.concat(
+            [old_train_data, new_train_data], ignore_index=True
+        )
+        test_data = pd.concat(
+            [old_test_data, new_test_data], ignore_index=True
+        )
+
         X_train, X_test, y_train, y_test, mapping = (
             GetPreparedData(train_data, test_data, prep_type=prep_type, seed=seed,
                             prep_name=prep_name)
@@ -665,8 +680,25 @@ def run_prep(prep_type):
     tensor_dir = os.path.join(base_dir, TENSOR_ROOT, ALGO, prep_name)
     os.makedirs(tensor_dir, exist_ok=True)
 
-    train_data = pd.read_csv(os.path.join(base_dir, "Dataset", "new_train_company.csv"))
-    test_data  = pd.read_csv(os.path.join(base_dir, "Dataset", "new_test_company.csv"))
+    old_train_data = pd.read_csv(os.path.join(base_dir, "Dataset", "train_company.csv"))
+    old_test_data  = pd.read_csv(os.path.join(base_dir, "Dataset", "test_company.csv"))
+    new_train_data = pd.read_csv(os.path.join(base_dir, "Dataset", "new_train_company.csv"))
+    new_test_data  = pd.read_csv(os.path.join(base_dir, "Dataset", "new_test_company.csv"))
+
+    # concatenate and set new feature as NotA in old dataframe
+    feat_name = next(iter(NEW_FEATURE_NAMES))
+    feat_pos = new_train_data.columns.get_loc(feat_name)
+
+    for df in (old_train_data, old_test_data):
+        df.insert(feat_pos, feat_name, "NotA")
+
+    train_data = pd.concat(
+        [old_train_data, new_train_data], ignore_index=True
+    )
+    test_data = pd.concat(
+        [old_test_data, new_test_data], ignore_index=True
+    )
+
     np.random.seed(seed)
     (X_train, X_test, y_train, y_test, mapping) = GetPreparedData(
         train_data, test_data,
