@@ -74,6 +74,7 @@ from sklearn.preprocessing import LabelEncoder, StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 
 ALGO          = "PBP"
+MODEL_ROOT    = os.path.join("Model", "feat-incr")
 N_CLIENTS     = 4
 WORLD_SIZE_MM = 5      # 1 server (rank 0) + 4 clients (ranks 1-4)
 MT_PORT       = 7777   # localhost port for multithread TCPStore
@@ -92,6 +93,7 @@ LAMBDA_W = 1e-4
 # when some columns are dropped.  Switch to "Department" if your perception
 # feature is the subject department instead of designation.
 BEST_FEATURE_NAME = "DESIGNATION"   # Subject Designation (reference perception)
+NEW_FEATURE_NAMES = {"WORK_LOCATION"}
 
 
 def resolve_best_feature(columns):
@@ -120,28 +122,106 @@ def resolve_feature_indices(old_columns, current_columns):
     return old_indices, new_indices
 
 
+def resolve_checkpoint_feature_indices(current_columns, old_columns,
+                                       old_input_dim,
+                                       new_feature_names=NEW_FEATURE_NAMES):
+    """Locate inserted feature columns and validate the baseline width.
+
+    Baseline checkpoints in this repository predate schema metadata, so the
+    processed old schema is checked against the expanded schema.  This both
+    identifies the explicitly named new attribute and prevents a silent
+    permutation of old columns.
+    """
+    current_keys = _column_keys(current_columns)
+    old_keys = _column_keys(old_columns)
+    new_indices = [index for index, (name, _) in enumerate(current_keys)
+                   if name in new_feature_names]
+    old_indices = [index for index in range(len(current_keys))
+                   if index not in set(new_indices)]
+    if not new_indices:
+        raise ValueError(
+            f"No new feature found. Expected one of {sorted(new_feature_names)}"
+        )
+    if len(old_indices) != old_input_dim or len(old_keys) != old_input_dim:
+        raise ValueError(
+            f"Old schema/checkpoint width mismatch: old schema={len(old_keys)}, "
+            f"expanded old columns={len(old_indices)}, checkpoint={old_input_dim}."
+        )
+    expanded_old_keys = [current_keys[index] for index in old_indices]
+    if expanded_old_keys != old_keys:
+        raise ValueError(
+            "Expanded dataset old-column order does not match the baseline "
+            f"schema. Baseline={old_keys}; expanded={expanded_old_keys}."
+        )
+    return old_indices, new_indices
+
+
+def load_baseline_state(checkpoint_path):
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(f"Baseline checkpoint not found: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        checkpoint = checkpoint["model_state_dict"]
+    required = {"fc1.weight", "fc1.bias", "fc2.weight", "fc2.bias"}
+    missing = required.difference(checkpoint.keys())
+    if missing:
+        raise ValueError(f"Baseline checkpoint is missing parameters: {sorted(missing)}")
+    state = {key: checkpoint[key].detach().cpu() for key in required}
+    if state["fc1.weight"].ndim != 2 or state["fc1.bias"].shape != (state["fc1.weight"].shape[0],):
+        raise ValueError("Baseline checkpoint has an invalid fc1 architecture")
+    if state["fc2.weight"].shape != (1, state["fc1.weight"].shape[0]):
+        raise ValueError("Baseline checkpoint has an incompatible fc2 architecture")
+    if state["fc2.bias"].shape != (1,):
+        raise ValueError("Baseline checkpoint has an invalid fc2 bias")
+    return state
+
+
 # ─── Model definitions ────────────────────────────────────────────────────────
 
 class ArtificialNeuralNetwork(nn.Module):
-    def __init__(self, input_dim, hidden_layer_size=64,
+    """ANN used for either the frozen baseline or expanded current model."""
+
+    def __init__(self, input_dim, baseline_state=None,
+                 old_feature_indices=None, hidden_layer_size=64,
                  learning_rate=0.001, max_iter=200):
         super().__init__()
-        self.input_dim         = input_dim
-        self.hidden_layer_size = hidden_layer_size
-        self.learning_rate     = learning_rate
-        self.max_iter          = max_iter
-        self.fc1               = nn.Linear(input_dim, hidden_layer_size)
-        self.fc2               = nn.Linear(hidden_layer_size, 1)
-        self.relu              = nn.ReLU()
-        self.sigmoid           = nn.Sigmoid()
-        self.criterion         = nn.BCELoss(reduction='none') # per sample bce loss is needed
-        self.optimizer         = optim.Adam
+        self.input_dim = input_dim
+        self.learning_rate = learning_rate
+        self.max_iter = max_iter
+        self.criterion = nn.BCELoss(reduction="none")
+        self.fc1 = nn.Linear(input_dim, hidden_layer_size)
+        self.fc2 = nn.Linear(hidden_layer_size, 1)
+        self.hidden_layer_size = self.fc1.out_features
+
+        if baseline_state is not None:
+            if old_feature_indices is None:
+                raise ValueError(
+                    "old_feature_indices are required for the expanded model"
+                )
+            old_indices = list(old_feature_indices)
+            old_weight = baseline_state["fc1.weight"]
+            if len(old_indices) != old_weight.shape[1]:
+                raise ValueError(
+                    "The expanded old-feature positions do not match the "
+                    "baseline checkpoint width."
+                )
+            # Copy only the old-feature columns.  The new columns retain the
+            # normal nn.Linear initialization for the current model.
+            with torch.no_grad():
+                self.fc1.weight[:, old_indices] = old_weight
+                self.fc1.bias.copy_(baseline_state["fc1.bias"])
+                self.fc2.weight.copy_(baseline_state["fc2.weight"])
+                self.fc2.bias.copy_(baseline_state["fc2.bias"])
 
     def forward(self, x):
-        return self.sigmoid(self.fc2(self.relu(self.fc1(x))))
+        return torch.sigmoid(self.fc2(torch.relu(self.fc1(x))))
 
-
-models_dict = {"ArtificialNeuralNetwork": ArtificialNeuralNetwork}
+    def merged_state_dict(self):
+        """Return the expanded current model as a normal ANN checkpoint."""
+        return {
+            key: value.detach().clone()
+            for key, value in self.state_dict().items()
+        }
 
 
 # ─── ABAC attribute groups ────────────────────────────────────────────────────
@@ -208,27 +288,21 @@ def cleanup():
 # ─── Weight aggregation ───────────────────────────────────────────────────────
 
 def aggregate_multithread(model, world_size):
-    for param in model.parameters():
-        dist.all_reduce(param.data, op=dist.ReduceOp.SUM)
-        param.data /= world_size
+    """FedAvg the current expanded model across the client processes."""
+    for parameter in model.parameters():
+        dist.all_reduce(parameter.data, op=dist.ReduceOp.SUM)
+        parameter.data /= world_size
 
 
-def aggregate_multimachine(rank, *models, n_clients=N_CLIENTS):
-    """
-    FedAvg: reduce to server (rank 0) → average over n_clients → broadcast.
-    Server acts as pure aggregator; its initialisation weights are not
-    included in the average (divide by n_clients, not world_size).
-    """
-    for model in models:
-        for param in model.parameters():
-            # The server is not a training client. Clear its local copy before
-            # reduction so the sum contains only ranks 1..N_CLIENTS.
-            if rank == 0:
-                param.data.zero_()
-            dist.reduce(param.data, dst=0, op=dist.ReduceOp.SUM)
-            if rank == 0:
-                param.data /= n_clients
-            dist.broadcast(param.data, src=0)
+def aggregate_multimachine(rank, model, n_clients=N_CLIENTS):
+    """FedAvg the current expanded model across physical machines."""
+    for parameter in model.parameters():
+        if rank == 0:
+            parameter.data.zero_()
+        dist.reduce(parameter.data, dst=0, op=dist.ReduceOp.SUM)
+        if rank == 0:
+            parameter.data /= n_clients
+        dist.broadcast(parameter.data, src=0)
 
 
 # ─── Attribute mapping helpers ────────────────────────────────────────────────
@@ -274,8 +348,72 @@ def GetAttributeMapping(data, grp=None, grp_gap=20, map_type=1):
     return mappings
 
 
-def encode_attributes(data, mapping):
+def GetBaselineAttributeMapping(data, grp=None, grp_gap=20, map_type=1):
+    """Reproduce the flat mapping used by the original PBP_Company.py."""
+    mapping = {"NotA": -1, 0: 0, "YES": 1, "NO": 0}
+    if map_type == 1:
+        for col in data.columns[:4]:
+            count = 1
+            for value in data[col].unique():
+                if value != "NotA":
+                    mapping[value] = count
+                    count += 1
+    elif map_type == 2:
+        for col in data.columns[1:3]:
+            count = 1
+            for value in data[col].unique():
+                if value != "NotA":
+                    mapping[value] = count
+                    count += 1
+        for group_name in grp or {}:
+            group_number = 1
+            for members in grp[group_name]:
+                member_number = 1
+                for value in members:
+                    mapping[value] = group_number * grp_gap + member_number
+                    member_number += 1
+                group_number += 1
+    return mapping
+
+
+def encode_baseline_with_new_features(data, baseline_mapping,
+                                      new_feature_names=NEW_FEATURE_NAMES):
+    """Apply baseline mapping globally and new mappings only to new columns."""
+    # Object dtype is required because the targeted new column may change
+    # from strings to integer codes after the global baseline replacement.
+    encoded = data.replace(baseline_mapping).astype(object)
+    new_mapping = dict(baseline_mapping)
+
+    for index, column in enumerate(data.columns):
+        if column not in new_feature_names:
+            continue
+
+        next_value = 1
+        for value in data.iloc[:, index].unique():
+            if value != "NotA" and value not in new_mapping:
+                new_mapping[value] = next_value
+                next_value += 1
+
+        # Use raw values from the original column. This prevents newly added
+        # category keys from affecting any existing feature column.
+        encoded.iloc[:, index] = data.iloc[:, index].map(
+            lambda value: new_mapping.get(value, value)
+        )
+
+    return encoded
+
+
+def encode_attributes(data, mapping, uniform_mapping=False,
+                      new_feature_names=None):
     """Apply per-column mappings using duplicate-column-aware identities."""
+    if uniform_mapping:
+        # This is intentionally the same operation used by the baseline PBP
+        # implementation. Existing feature values must retain its assignments.
+        if new_feature_names:
+            return encode_baseline_with_new_features(
+                data, mapping, new_feature_names
+            )
+        return data.replace(mapping)
     # Object dtype is required because categorical string columns are being
     # replaced by numeric codes.
     encoded = data.copy().astype(object)
@@ -298,19 +436,24 @@ def chk_nota(col):
 # ─── Data preparation (policy-enforcement artefacts removed) ──────────────────
 # Prepare the data for Training and Testing based on relation
 def GetPreparedData(train_data, test_data, prep_type=5, seed=0,
-                    prep_name="NaiveNA", mapping=None):
+                    prep_name="NaiveNA", mapping=None,
+                    uniform_mapping=False, new_feature_names=None):
     data = pd.concat([train_data, test_data], axis=0)
     if mapping is None:
         mapping = GetAttributeMapping(data, grp=attr_grp,
                                       map_type=1 if prep_type in (1, 2, 5) else 2)
     if prep_type == 1:  # Naive (Normal encoding)
         map_type = 1
-        data_encoded = encode_attributes(data, mapping)
+        data_encoded = encode_attributes(
+            data, mapping, uniform_mapping, new_feature_names
+        )
     elif (
         prep_type == 2
     ):  # Columns for same attribute values in subject and object (ARFE)
         map_type = 1
-        data_encoded = encode_attributes(data, mapping)
+        data_encoded = encode_attributes(
+            data, mapping, uniform_mapping, new_feature_names
+        )
         data_encoded["sameProj"] = data_encoded.apply(
             lambda x: same_conditions(x["Project_name"], x["Project_Name"]), axis=1
         )
@@ -325,12 +468,16 @@ def GetPreparedData(train_data, test_data, prep_type=5, seed=0,
         prep_type == 3
     ):  # Grouping of attributes (Encoding based on atrribute group) (AVC)
         map_type = 2
-        data_encoded = encode_attributes(data, mapping)
+        data_encoded = encode_attributes(
+            data, mapping, uniform_mapping, new_feature_names
+        )
     elif (
         prep_type == 4
     ):  # Grouping of attributes + Columns for same attribute values in subject and object (ARFE + AVC)
         map_type = 2
-        data_encoded = encode_attributes(data, mapping)
+        data_encoded = encode_attributes(
+            data, mapping, uniform_mapping, new_feature_names
+        )
         data_encoded["sameProj"] = data_encoded.apply(
             lambda x: same_conditions(x["Project_name"], x["Project_Name"]), axis=1
         )
@@ -343,7 +490,9 @@ def GetPreparedData(train_data, test_data, prep_type=5, seed=0,
         data_encoded = data_encoded.drop("Project_Name", axis=1)
     elif prep_type == 5:  # Naive + NACol (Type 1 with extra encoding for NA_Cols)
         map_type = 1
-        data_encoded = encode_attributes(data, mapping)
+        data_encoded = encode_attributes(
+            data, mapping, uniform_mapping, new_feature_names
+        )
         data_encoded["Proj_NA"] = data_encoded.apply(
             lambda x: chk_nota(x["Project_name"]), axis=1
         )
@@ -419,7 +568,12 @@ def partition_dataset(X_train, y_train, best_feature, best_feature_name, n_clien
 # modified to retain original indices for sample weights
 def get_data_loaders(X_clients, y_clients, batch_size=32):
     data_loaders = []
-    for X, y in zip(X_clients, y_clients):
+    for client_number, (X, y) in enumerate(zip(X_clients, y_clients), start=1):
+        if len(X) == 0:
+            raise ValueError(
+                f"Client {client_number} has no samples; cannot create a "
+                "federated DataLoader."
+            )
         indices = torch.arange(len(X))
         dataset = TensorDataset(X, y, indices)
         data_loaders.append(
@@ -435,29 +589,15 @@ def get_data_loaders(X_clients, y_clients, batch_size=32):
 # Balancing regulariser
 def calculating_balancing_regulariser(X, u):
     """
-    Calculate the balancing regularizer Phi_u(X)
-    from Eq. (7) of Ni et al. -> Phi_u(X) = || X~ (T-C) ||^2
+    Calculate the balancing regularizer Phi_u(X) from Eq. (7) of Ni et al.
 
-    X: [n_samples, n_features]
-    u: [n_samples]
-
-    For each feature X_j and each distinct category k:
-        treatment = I(X_j == k)
-        control   = I(X_j != k)
-
-    This generalizes the paper's binary treatment/control formulation
-    to categorical features while keeping the same weighted
-    first-order moment balancing objective.
-
-    Every distinct encoded value is treated as a valid category,
-    including -1 (NotA).
+    Every distinct encoded value is treated as a category.  For each feature
+    and category, the weighted first moments of all remaining features are
+    matched between the category and its complement.
     """
-
     n_samples, n_features = X.shape
-
     total_bal = torch.tensor(0.0, device=X.device, dtype=X.dtype)
-
-    eps = 1e-8 # avoid div by 0
+    eps = 1e-8
 
     for j in range(n_features):
         # Treatment feature X_j
@@ -465,7 +605,9 @@ def calculating_balancing_regulariser(X, u):
 
         categories = torch.unique(X_j)
         # remaining features X_(-j)
-        remaining_mask = torch.ones(n_features, device=X.device, dtype=torch.bool)
+        remaining_mask = torch.ones(
+            n_features, device=X.device, dtype=torch.bool
+        )
         remaining_mask[j] = False
         X_remaining = X[:, remaining_mask]
 
@@ -476,179 +618,130 @@ def calculating_balancing_regulariser(X, u):
             # Everything not belonging to this category is control.
             control = (X_j != category).to(X.dtype)
 
-            # Weighted sizes of treatment and control groups.            
-            T_wt = torch.sum(u * treatment)
-            C_wt = torch.sum(u * control)
+            # Weighted sizes of treatment and control groups.
+            treatment_mass = torch.sum(u * treatment)
+            control_mass = torch.sum(u * control)
 
             # Skip if one of the groups has zero weighted mass.
-            if T_wt <= eps or C_wt <= eps:
+            if treatment_mass <= eps or control_mass <= eps:
                 continue
 
             # Normalized weighted treatment/control sample weights.
             # T_j = u ⊙ X_j / u^T X_j
             # C_j = u ⊙ (1 - X_j) / u^T (1 - X_j)
-            T_j = u * treatment / (T_wt + eps)
-            C_j = u * control / (C_wt + eps)
-
-            # Weighted first-order moments of all remaining features.
-            T_M = X_remaining.T @ T_j
-            C_M = X_remaining.T @ C_j
-
-            # Difference in treatment/control moments.
-            M_diff = T_M - C_M
-
-            # Same squared moment-difference objective.
-            total_bal += torch.sum(M_diff ** 2)
+            treatment_weights = u * treatment / (treatment_mass + eps)
+            control_weights = u * control / (control_mass + eps)
+            treatment_moments = X_remaining.T @ treatment_weights
+            control_moments = X_remaining.T @ control_weights
+            total_bal += torch.sum(
+                (treatment_moments - control_moments) ** 2
+            )
 
     return total_bal
 
+
 def model_wt_regulariser(model):
+    """L2 penalty on the model parameters."""
     return sum(
-        torch.sum(param ** 2) for param in model.parameters()
+        torch.sum(parameter ** 2) for parameter in model.parameters()
     )
 
-# ─── Train / Test ─────────────────────────────────────────────────────────────
 
-def train_local(rank, prev_model, prev_loader, curr_model, curr_loader, device,
-                old_feature_indices):
+def model_consistency_regulariser(baseline_model, current_model,
+                                  old_feature_indices):
+    """Match current-model old-feature weights to the frozen baseline."""
+    old_indices = torch.as_tensor(
+        old_feature_indices, dtype=torch.long,
+        device=current_model.fc1.weight.device,
+    )
+    baseline_weight = baseline_model.fc1.weight.detach()
+    return torch.sum(
+        (baseline_weight - current_model.fc1.weight[:, old_indices]) ** 2
+    )
 
-    n_old = len(prev_loader.dataset)
-    n_curr = len(curr_loader.dataset)
 
-    # Paper parameterizes non-negative sample weights as:
-    # u = v ⊙ v
-    # this guarantees u >= 0
-    # Initialize u_i = 1 / n so that sum(u) = 1 initially.
-    v1 = nn.Parameter(
+def train_local(rank, baseline_model, current_model, loader, device,
+                old_feature_indices, optimizer=None):
+    """Alternately optimize current-model weights and expanded-data weights."""
+    if optimizer is None:
+        optimizer = optim.Adam(
+            current_model.parameters(), lr=current_model.learning_rate
+        )
+
+    n_samples = len(loader.dataset)
+    v = nn.Parameter(
         torch.full(
-            (n_old,),
-            1.0 / math.sqrt(n_old),
-            device=device
+            (n_samples,), 1.0 / math.sqrt(n_samples), device=device
         )
     )
-
-    v2 = nn.Parameter(
-        torch.full(
-            (n_curr,),
-            1.0 / math.sqrt(n_curr),
-            device=device
-        )
-    )
-
-    # Jointly optimize:
-    #   1. ANN parameters
-    #   2. sample-weight parameters v
-    
-    # Separate optimizers for the four alternating updates
-    opt_w1 = optim.Adam(
-        prev_model.parameters(),
-        lr=prev_model.learning_rate
-    )
-
-    opt_w2 = optim.Adam(
-        curr_model.parameters(),
-        lr=curr_model.learning_rate
-    )
-
-    opt_u1 = optim.Adam(
-        [v1],
-        lr=prev_model.learning_rate
-    )
-
-    opt_u2 = optim.Adam(
-        [v2],
-        lr=curr_model.learning_rate
-    )
-
+    weight_optimizer = optim.Adam([v], lr=current_model.learning_rate)
     start = time.time()
-    prev_model.train()
-    curr_model.train()
+    baseline_model.eval()
+    current_model.train()
 
-    for epoch in range(prev_model.max_iter):
-        
-        ### Update w(2). Fix w(1), u(1), u(2)
-        u1, u2 = (v1 * v1).detach(), (v2 * v2).detach()
+    for epoch in range(current_model.max_iter):
+        epoch_loss = 0.0
+        batches = 0
 
-        for X_b, y_b, i_b in curr_loader:
-            X_b, y_b, i_b = X_b.to(device), y_b.to(device), i_b.to(device)
-            u2_b = u2[i_b]
+        # Update current-model parameters with u fixed.
+        u = (v * v).detach()
+        for X_b, y_b, i_b in loader:
+            X_b, y_b, i_b = (
+                X_b.to(device), y_b.to(device), i_b.to(device)
+            )
+            u_b = u[i_b]
+            prediction_loss = torch.sum(
+                u_b * current_model.criterion(current_model(X_b), y_b).view(-1)
+            )
+            consistency_reg = LAMBDA_CON * model_consistency_regulariser(
+                baseline_model, current_model, old_feature_indices
+            )
+            model_reg = LAMBDA_W * model_wt_regulariser(current_model)
+            loss = prediction_loss + consistency_reg + model_reg
 
-            pred = curr_model(X_b)
-            bce = curr_model.criterion(pred, y_b)
-            pred_loss = torch.sum(u2_b * bce)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            batches += 1
 
-            # w(1) fixed here
-            consistency_reg = LAMBDA_CON * torch.sum(
-                (prev_model.fc1.weight.detach() -
-                 curr_model.fc1.weight[:, old_feature_indices]) ** 2
+        # Update u=v*v with current-model parameters fixed.
+        for X_b, y_b, i_b in loader:
+            X_b, y_b, i_b = (
+                X_b.to(device), y_b.to(device), i_b.to(device)
+            )
+            u = v * v
+            u_b = u[i_b]
+            with torch.no_grad():
+                bce = current_model.criterion(
+                    current_model(X_b), y_b
+                ).view(-1)
+
+            prediction_loss = torch.sum(u_b * bce)
+            balancing_reg = LAMBDA_BAL * calculating_balancing_regulariser(
+                X_b, u_b
+            )
+            sample_weight_reg = LAMBDA_U * torch.sum(u ** 2)
+            sample_weight_norm = LAMBDA_U_NORM * (
+                torch.sum(u) - 1.0
+            ) ** 2
+            loss = (
+                prediction_loss
+                + balancing_reg
+                + sample_weight_reg
+                + sample_weight_norm
             )
 
-            model_reg = LAMBDA_W * model_wt_regulariser(curr_model)
+            weight_optimizer.zero_grad()
+            loss.backward()
+            weight_optimizer.step()
 
-            loss = pred_loss + consistency_reg + model_reg
-
-            opt_w2.zero_grad(); loss.backward(); opt_w2.step()
-
-        ### Update w(1). Fix w(2), u(1), u(2)
-        u1, u2 = (v1 * v1).detach(), (v2 * v2).detach()
-
-        for X_b, y_b, i_b in prev_loader:
-            X_b, y_b, i_b = X_b.to(device), y_b.to(device), i_b.to(device)
-            u1_b = u1[i_b]
-
-            pred = prev_model(X_b)
-            bce = prev_model.criterion(pred, y_b)
-
-            pred_loss = torch.sum(u1_b * bce)
-            # w(2) fixed here
-            consistency_reg = LAMBDA_CON * torch.sum(
-                (prev_model.fc1.weight -
-                 curr_model.fc1.weight[:, old_feature_indices].detach()) ** 2
-            )
-            model_reg = LAMBDA_W * model_wt_regulariser(prev_model)
-            loss = pred_loss + consistency_reg + model_reg
-
-            opt_w1.zero_grad(); loss.backward(); opt_w1.step()
-
-        ### Update u(1) through v(1). Fix w(1), w(2), u(2)
-        for X_b, y_b, i_b in prev_loader:
-            X_b, y_b, i_b = X_b.to(device), y_b.to(device), i_b.to(device)
-            u1 = v1 * v1
-            u1_b = u1[i_b]
-
-            with torch.no_grad(): # to fix weights
-                pred = prev_model(X_b)
-                bce = prev_model.criterion(pred, y_b)
-
-            pred_loss = torch.sum(u1_b * bce)
-            bal_reg = LAMBDA_BAL * calculating_balancing_regulariser(X=X_b, u=u1_b)
-            sample_wt_reg = LAMBDA_U * torch.sum(u1 ** 2)
-            sample_wt_norm = LAMBDA_U_NORM * (torch.sum(u1) - 1.0) ** 2
-            loss = pred_loss + bal_reg + sample_wt_reg + sample_wt_norm
-
-            opt_u1.zero_grad(); loss.backward(); opt_u1.step()
-
-        ### Update u(2) through v(2). Fix w(1), w(2), u(1)
-        for X_b, y_b, i_b in curr_loader:
-            X_b, y_b, i_b = X_b.to(device), y_b.to(device), i_b.to(device)
-            u2 = v2 * v2
-            u2_b = u2[i_b]
-
-            with torch.no_grad(): # to fix weights
-                pred = curr_model(X_b)
-                bce = curr_model.criterion(pred, y_b)
-
-            pred_loss = torch.sum(u2_b * bce)
-            bal_reg = LAMBDA_BAL * calculating_balancing_regulariser(X=X_b, u=u2_b)
-            sample_wt_reg = LAMBDA_U * torch.sum(u2 ** 2)
-            sample_wt_norm = LAMBDA_U_NORM * (torch.sum(u2) - 1.0) ** 2
-            loss = pred_loss + bal_reg + sample_wt_reg + sample_wt_norm
-
-            opt_u2.zero_grad(); loss.backward(); opt_u2.step()
-        
         if (epoch + 1) % 5 == 0:
-            print(f"[Client {rank}] Epoch {epoch+1}/{prev_model.max_iter}  "
-                  f"Loss={loss.item():.4f}")
+            print(
+                f"[Client {rank}] Epoch {epoch+1}/{current_model.max_iter}  "
+                f"Loss={epoch_loss / max(batches, 1):.4f}"
+            )
+
     elapsed = time.time() - start
     print(f"[Client {rank}] Training done in {elapsed:.2f}s")
     return elapsed
@@ -728,7 +821,7 @@ def save_consolidated_result(base_dir, algo, prep_name, model_name,
             "TrainRecords":    train_records,
             "TestRecords":     test_records,
         })
-    print(f"[INFO] Consolidated result appended → {csv_path}")
+    print(f"[INFO] Consolidated result appended - {csv_path}")
 
 
 def log_initial_details(model_name, world_size, X_clients,
@@ -773,483 +866,339 @@ def aggregate_metrics(current_folder_path):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def run_federated_multithread(
-    rank, world_size, model_class,
-
-    # Old feature set
-    X_prev_train, X_prev_test, y_prev_train, y_prev_test,
-    X_prev_clients, y_prev_clients,
-    prev_yes_no_counts, prev_partition_details,
-
-    # Current feature set
-    X_curr_train, X_curr_test, y_curr_train, y_curr_test,
-    X_curr_clients, y_curr_clients,
-    curr_yes_no_counts, curr_partition_details,
-
+    rank, world_size, model_class, baseline_state,
+    X_train, X_test, y_train, y_test,
+    X_clients, y_clients, yes_no_counts, partition_details,
     results_dir, model_path, time_file, log_file,
-    base_dir, prep_name, old_feature_indices, new_feature_indices,
+    base_dir, prep_name, old_feature_indices,
 ):
+    """Federated P' = P + Delta P training on the expanded dataset only."""
     setup_multithread(rank, world_size)
     device = torch.device("cpu")
-    # models
-    prev_model = model_class(X_prev_train.shape[1]).to(device)
-    curr_model = model_class(X_curr_train.shape[1]).to(device)
-
-    with torch.no_grad():
-        # copy old model weights into new model only for old features
-        curr_model.fc1.weight[:, old_feature_indices].copy_(prev_model.fc1.weight)
-
-        # everything after 1st layer is unchanged by new input feature
-        curr_model.fc1.bias.copy_(prev_model.fc1.bias)
-        curr_model.fc2.weight.copy_(prev_model.fc2.weight)
-        curr_model.fc2.bias.copy_(prev_model.fc2.bias)
-
-    # data loaders
-    prev_loaders = get_data_loaders(X_prev_clients, y_prev_clients)
-    curr_loaders = get_data_loaders(X_curr_clients, y_curr_clients)
+    old_input_dim = baseline_state["fc1.weight"].shape[1]
+    baseline_model = model_class(old_input_dim).to(device)
+    baseline_model.load_state_dict(baseline_state)
+    for parameter in baseline_model.parameters():
+        parameter.requires_grad = False
+    current_model = model_class(
+        X_train.shape[1], baseline_state, old_feature_indices
+    ).to(device)
+    loaders = get_data_loaders(X_clients, y_clients)
+    optimizer = optim.Adam(
+        current_model.parameters(), lr=current_model.learning_rate
+    )
 
     if rank == 0:
-        prev_test_loader = DataLoader(
-            TensorDataset(X_prev_test, y_prev_test),
-            batch_size=32,
-            shuffle=False
+        test_loader = DataLoader(
+            TensorDataset(X_test, y_test), batch_size=32, shuffle=False
         )
-
-        curr_test_loader = DataLoader(
-            TensorDataset(X_curr_test, y_curr_test),
-            batch_size=32,
-            shuffle=False
+        test_yes_no = (
+            (y_test == 1).sum().item(), (y_test == 0).sum().item()
         )
-
-        prev_test_ync = (
-            (y_prev_test == 1).sum().item(),
-            (y_prev_test == 0).sum().item()
-        )
-
-        curr_test_ync = (
-            (y_curr_test == 1).sum().item(),
-            (y_curr_test == 0).sum().item()
-        )
-        
         log_initial_details(
-            model_class.__name__, world_size, X_prev_clients,
-            len(X_prev_train), len(X_prev_test),
-            prev_yes_no_counts, prev_test_ync,
-            prev_partition_details, log_file,
+            "ArtificialNeuralNetwork", world_size, X_clients,
+            len(X_train), len(X_test), yes_no_counts, test_yes_no,
+            partition_details, log_file,
         )
 
-        log_initial_details(
-            model_class.__name__, world_size, X_curr_clients,
-            len(X_curr_train), len(X_curr_test),
-            curr_yes_no_counts, curr_test_ync,
-            curr_partition_details, log_file,
-        )
-
-    fed_rounds  = 50
-    start       = time.time()
+    fed_rounds = 50
+    model_name = "ArtificialNeuralNetwork"
+    start = time.time()
     total_inf_t = []
     acc = prec = rec = f1 = 0.0
 
     for r in range(fed_rounds):
         if rank == 0:
             print(f"[MT] Round {r+1}/{fed_rounds}")
-
         train_time = train_local(
-            rank, prev_model, prev_loaders[rank], curr_model, curr_loaders[rank],
-            device, old_feature_indices,
+            rank, baseline_model, current_model, loaders[rank], device,
+            old_feature_indices, optimizer
         )
-        aggregate_multithread(prev_model, world_size)
-        aggregate_multithread(curr_model, world_size)
+        aggregate_multithread(current_model, world_size)
 
-        # --------------------------------------------------------
-        # Evaluate the CURRENT feature-set model
-        #
-        # This is the model that has access to the newly added
-        # feature and is therefore the final feature-incremental
-        # model.
-        # --------------------------------------------------------
         if rank == 0:
-            acc, prec, rec, f1, inf_t = evaluate(curr_model, curr_test_loader, device)
+            acc, prec, rec, f1, inf_t = evaluate(
+                current_model, test_loader, device
+            )
             total_inf_t.extend(inf_t)
-            save_round_result(model_class.__name__, acc, prec, rec, f1, results_dir)
+            save_round_result(model_name, acc, prec, rec, f1, results_dir)
             with open(log_file, "a") as lf:
-                lf.write(f"Round {r+1}  TrainTime={train_time:.4f}s  "
-                         f"AvgInference={np.mean(inf_t):.10f}s\n")
+                lf.write(
+                    f"Round {r+1}  TrainTime={train_time:.4f}s  "
+                    f"AvgInference={np.mean(inf_t):.10f}s\n"
+                )
 
     total_train_time = time.time() - start
-    save_training_time(model_class.__name__, rank, total_train_time, time_file)
+    save_training_time("ArtificialNeuralNetwork", rank, total_train_time, time_file)
 
-    # Save final CURRENT model
     if rank == 0:
         os.makedirs(model_path, exist_ok=True)
-        save_path = os.path.join(model_path, f"{model_class.__name__}_feat_incr_final.pth")
-        torch.save(curr_model.state_dict(), save_path)
-        print(f"[INFO] Feat. Incr. Model saved → {save_path}")
-
+        save_path = os.path.join(
+            model_path, f"{model_name}_feat_incr_final.pth"
+        )
+        torch.save(current_model.merged_state_dict(), save_path)
+        print(f"[INFO] Feat. Incr. Model saved -> {save_path}")
         avg_inf_ms = np.mean(total_inf_t) * 1000 if total_inf_t else 0.0
         save_consolidated_result(
-            base_dir, ALGO, prep_name, model_class.__name__,
-            acc, prec, rec, f1,
-            total_train_time, avg_inf_ms,
-            int(len(X_curr_train)), int(len(X_curr_test)),
+            base_dir, ALGO, prep_name, model_name,
+            acc, prec, rec, f1, total_train_time, avg_inf_ms,
+            int(len(X_train)), int(len(X_test)),
         )
 
     cleanup()
 
 
+# New feature-incremental entry point: expanded data + baseline checkpoint.
 def main(prep_type):
     prep_names = {2: "ARFE", 3: "AVC", 4: "ARFE_AVC", 5: "NaiveNA"}
-    prep_name  = prep_names.get(prep_type, f"Prep{prep_type}")
+    prep_name = prep_names.get(prep_type, f"Prep{prep_type}")
+    seed = 0
+    base_dir = os.path.dirname(os.path.abspath(__file__))
 
-    for seed in range(1):
-        print(f"\n{'='*60}")
-        print(f"[{ALGO}] prep_type={prep_type} ({prep_name})  "
-              f"seed={seed}  mode=multithread")
-        print(f"{'='*60}")
-        np.random.seed(seed)
+    results_dir = os.path.join(
+        base_dir, "Results", "feat-incr", "Company", ALGO,
+        prep_name, f"Seed_{seed}"
+    )
+    model_path = os.path.join(base_dir, MODEL_ROOT, prep_name)
+    os.makedirs(results_dir, exist_ok=True)
+    os.makedirs(model_path, exist_ok=True)
+    time_file = os.path.join(results_dir, "train_times.csv")
+    log_file = os.path.join(results_dir, "training_log.txt")
+    initialize_time_file(time_file)
 
-        base_dir = current_folder_path = os.path.dirname(os.path.abspath(__file__))
+    # Load the old files only to reproduce the baseline encoding and validate
+    # the old processed schema. They are not used as training examples.
+    old_train_data = pd.read_csv(os.path.join(base_dir, "Dataset", "train_company.csv"))
+    old_test_data = pd.read_csv(os.path.join(base_dir, "Dataset", "test_company.csv"))
+    train_data = pd.read_csv(os.path.join(base_dir, "Dataset", "new_train_company.csv"))
+    test_data = pd.read_csv(os.path.join(base_dir, "Dataset", "new_test_company.csv"))
+    mapping_type = 1 if prep_type in (1, 2, 5) else 2
+    baseline_mapping = GetBaselineAttributeMapping(
+        pd.concat([old_train_data, old_test_data], axis=0),
+        grp=attr_grp, map_type=mapping_type,
+    )
+    X_old, _, _, _, _ = GetPreparedData(
+        old_train_data, old_test_data, prep_type=prep_type, seed=seed,
+        prep_name=prep_name, mapping=baseline_mapping,
+        uniform_mapping=True,
+    )
+    X_train, X_test, y_train, y_test, _ = GetPreparedData(
+        train_data, test_data, prep_type=prep_type, seed=seed,
+        prep_name=prep_name, mapping=baseline_mapping,
+        uniform_mapping=True,
+        new_feature_names=NEW_FEATURE_NAMES,
+    )
 
-        results_dir     = os.path.join(current_folder_path, "Results", "Company",
-                                       ALGO, prep_name, f"Seed_{seed}")
-        model_path      = os.path.join(current_folder_path, "Model", ALGO, prep_name)
-        os.makedirs(results_dir,     exist_ok=True)
-        os.makedirs(model_path,      exist_ok=True)
+    checkpoint_path = os.path.join(
+        base_dir, "Model", "old", "PBP", prep_name,
+        "ArtificialNeuralNetwork_final.pth",
+    )
+    baseline_state = load_baseline_state(checkpoint_path)
+    old_input_dim = baseline_state["fc1.weight"].shape[1]
+    old_feature_indices, new_feature_indices = resolve_checkpoint_feature_indices(
+        X_train.columns, X_old.columns, old_input_dim
+    )
+    print(
+        f"[INFO] Baseline={checkpoint_path} | old_features={old_input_dim} | "
+        f"expanded_features={X_train.shape[1]} | "
+        f"new_positions={new_feature_indices}"
+    )
 
-        time_file = os.path.join(results_dir, "train_times.csv")
-        log_file  = os.path.join(results_dir, "training_log.txt")
-        initialize_time_file(time_file)
+    X_train_t = torch.tensor(X_train.values, dtype=torch.float32)
+    X_test_t = torch.tensor(X_test.values, dtype=torch.float32)
+    y_train_t = torch.tensor(y_train.values, dtype=torch.float32).view(-1, 1)
+    y_test_t = torch.tensor(y_test.values, dtype=torch.float32).view(-1, 1)
+    np.random.seed(seed)
+    best_index, best_name = resolve_best_feature(X_train.columns)
+    X_clients, y_clients, yes_no_counts, partition_details, _ = partition_dataset(
+        X_train_t, y_train_t, best_index, best_name, N_CLIENTS
+    )
 
-        # Old feature set
-        train_data_prev = pd.read_csv(
-            os.path.join(current_folder_path, "Dataset", "train_company.csv")
-        )
-        test_data_prev = pd.read_csv(
-            os.path.join(current_folder_path, "Dataset", "test_company.csv")
-        )
-
-        # Build one per-attribute mapping from both feature sets. This keeps
-        # shared attributes numerically identical without mixing meanings
-        # across different columns.
-        train_data_curr = pd.read_csv(
-            os.path.join(current_folder_path, "Dataset", "new_train_company.csv")
-        )
-        test_data_curr = pd.read_csv(
-            os.path.join(current_folder_path, "Dataset", "new_test_company.csv")
-        )
-        shared_mapping_data = pd.concat(
-            [train_data_prev, test_data_prev, train_data_curr, test_data_curr],
-            axis=0,
-        )
-        mapping_type = 1 if prep_type in (1, 2, 5) else 2
-        shared_mapping = GetAttributeMapping(
-            shared_mapping_data, grp=attr_grp, map_type=mapping_type
-        )
-
-        X_prev_train, X_prev_test, y_prev_train, y_prev_test, mapping_prev = (
-            GetPreparedData(
-                train_data_prev, test_data_prev, prep_type=prep_type,
-                seed=seed, prep_name=prep_name,
-                mapping=shared_mapping,
-            )
-        )
-
-        # Current feature set = old features + one new feature
-        X_curr_train, X_curr_test, y_curr_train, y_curr_test, mapping_curr = (
-            GetPreparedData(
-                train_data_curr, test_data_curr, prep_type=prep_type,
-                seed=seed, prep_name=prep_name,
-                mapping=shared_mapping,
-            )
-        )
-        
-        # # temp check mappings -> mappings are different; need to generate consistent mappings
-        # print("\n=== OLD MAPPING ===")
-        # print(mapping_prev)
-
-        # print("\n=== NEW MAPPING ===")
-        # print(mapping_curr)
-
-        # Resolve the same PBP perception feature in both feature sets
-        best_feature_index_prev, best_feature_name_prev = resolve_best_feature(X_prev_train.columns)
-        best_feature_index_curr, best_feature_name_curr = resolve_best_feature(X_curr_train.columns)
-        old_feature_indices, new_feature_indices = resolve_feature_indices(
-            X_prev_train.columns, X_curr_train.columns
-        )
-
-        # Convert old feature set to tensors
-        X_prev_train_t = torch.tensor(X_prev_train.values, dtype=torch.float32)
-        X_prev_test_t  = torch.tensor(X_prev_test.values,  dtype=torch.float32)
-        y_prev_train_t = torch.tensor(y_prev_train.values, dtype=torch.float32).view(-1, 1)
-        y_prev_test_t  = torch.tensor(y_prev_test.values, dtype=torch.float32).view(-1, 1)
-
-        # Convert current feature set to tensors
-        X_curr_train_t = torch.tensor(X_curr_train.values, dtype=torch.float32)
-        X_curr_test_t  = torch.tensor(X_curr_test.values,  dtype=torch.float32)
-        y_curr_train_t = torch.tensor(y_curr_train.values, dtype=torch.float32).view(-1, 1)
-        y_curr_test_t  = torch.tensor(y_curr_test.values, dtype=torch.float32).view(-1, 1)
-
-        world_size = N_CLIENTS
-
-        # Partition old feature set
-        X_prev_clients, y_prev_clients, prev_yes_no_counts, prev_partition_details, prev_client_indices = partition_dataset(
-            X_prev_train_t, y_prev_train_t, best_feature_index_prev, best_feature_name_prev, world_size,
-        )
-
-        # Partition current feature set
-        X_curr_clients, y_curr_clients, curr_yes_no_counts, curr_partition_details, curr_client_indices = partition_dataset(
-            X_curr_train_t, y_curr_train_t, best_feature_index_curr, best_feature_name_curr, world_size,
-        )
-
-        for name, model_cls in models_dict.items():
-            print(f"[INFO] Training model: {name}")
-            torch.multiprocessing.spawn(
-                run_federated_multithread,
-                args=(
-                    world_size, model_cls,
-
-                    # Old feature set
-                    X_prev_train_t, X_prev_test_t, y_prev_train_t, y_prev_test_t,
-                    X_prev_clients, y_prev_clients, prev_yes_no_counts,
-                    prev_partition_details,
-                    # New feature set
-                    X_curr_train_t, X_curr_test_t, y_curr_train_t, y_curr_test_t,
-                    X_curr_clients, y_curr_clients, curr_yes_no_counts,
-                    curr_partition_details,
-
-                     results_dir, model_path, time_file, log_file,
-                     base_dir, prep_name, old_feature_indices, new_feature_indices,
-                ),
-                nprocs=world_size, join=True, start_method="spawn",
-            )
-
-    results_parent = os.path.split(results_dir)[0]
-    aggregate_metrics(results_parent)
+    torch.multiprocessing.spawn(
+        run_federated_multithread,
+        args=(
+            N_CLIENTS, ArtificialNeuralNetwork, baseline_state,
+            X_train_t, X_test_t, y_train_t, y_test_t,
+            X_clients, y_clients, yes_no_counts, partition_details,
+            results_dir, model_path, time_file, log_file,
+            base_dir, prep_name, old_feature_indices,
+        ),
+        nprocs=N_CLIENTS, join=True, start_method="spawn",
+    )
+    aggregate_metrics(os.path.dirname(results_dir))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  PREP  mode
 # ═══════════════════════════════════════════════════════════════════════════════
-### Unmodified for now
+# New multimachine preparation: persist only the expanded dataset.
 def run_prep(prep_type):
-    """Prepare and persist old/current tensors for multimachine training."""
     prep_names = {2: "ARFE", 3: "AVC", 4: "ARFE_AVC", 5: "NaiveNA"}
-    prep_name  = prep_names.get(prep_type, f"Prep{prep_type}")
-    seed       = 0
-
-    base_dir   = os.path.dirname(os.path.abspath(__file__))
+    prep_name = prep_names.get(prep_type, f"Prep{prep_type}")
+    seed = 0
+    base_dir = os.path.dirname(os.path.abspath(__file__))
     tensor_dir = os.path.join(base_dir, "Tensors", ALGO, prep_name)
     os.makedirs(tensor_dir, exist_ok=True)
 
-    train_data_prev = pd.read_csv(os.path.join(base_dir, "Dataset", "train_company.csv"))
-    test_data_prev  = pd.read_csv(os.path.join(base_dir, "Dataset", "test_company.csv"))
-    train_data_curr = pd.read_csv(os.path.join(base_dir, "Dataset", "new_train_company.csv"))
-    test_data_curr  = pd.read_csv(os.path.join(base_dir, "Dataset", "new_test_company.csv"))
-
+    old_train = pd.read_csv(os.path.join(base_dir, "Dataset", "train_company.csv"))
+    old_test = pd.read_csv(os.path.join(base_dir, "Dataset", "test_company.csv"))
+    train = pd.read_csv(os.path.join(base_dir, "Dataset", "new_train_company.csv"))
+    test = pd.read_csv(os.path.join(base_dir, "Dataset", "new_test_company.csv"))
     mapping_type = 1 if prep_type in (1, 2, 5) else 2
-    shared_mapping = GetAttributeMapping(
-        pd.concat([train_data_prev, test_data_prev, train_data_curr, test_data_curr],
-                  axis=0),
-        grp=attr_grp,
-        map_type=mapping_type,
+    baseline_mapping = GetBaselineAttributeMapping(
+        pd.concat([old_train, old_test]), grp=attr_grp, map_type=mapping_type
+    )
+    X_old, _, _, _, _ = GetPreparedData(
+        old_train, old_test, prep_type=prep_type, seed=seed,
+        prep_name=prep_name, mapping=baseline_mapping, uniform_mapping=True,
+    )
+    X_train, X_test, y_train, y_test, _ = GetPreparedData(
+        train, test, prep_type=prep_type, seed=seed,
+        prep_name=prep_name, mapping=baseline_mapping,
+        uniform_mapping=True, new_feature_names=NEW_FEATURE_NAMES,
+    )
+    checkpoint_path = os.path.join(
+        base_dir, "Model", "old", "PBP", prep_name,
+        "ArtificialNeuralNetwork_final.pth",
+    )
+    baseline_state = load_baseline_state(checkpoint_path)
+    old_input_dim = baseline_state["fc1.weight"].shape[1]
+    old_indices, new_indices = resolve_checkpoint_feature_indices(
+        X_train.columns, X_old.columns, old_input_dim
     )
 
+    X_train_t = torch.tensor(X_train.values, dtype=torch.float32)
+    X_test_t = torch.tensor(X_test.values, dtype=torch.float32)
+    y_train_t = torch.tensor(y_train.values, dtype=torch.float32).view(-1, 1)
+    y_test_t = torch.tensor(y_test.values, dtype=torch.float32).view(-1, 1)
     np.random.seed(seed)
-    X_prev, X_prev_test, y_prev, y_prev_test, _ = GetPreparedData(
-        train_data_prev, test_data_prev,
-        prep_type=prep_type, seed=seed, prep_name=prep_name,
-        mapping=shared_mapping,
+    best_index, best_name = resolve_best_feature(X_train.columns)
+    clients = partition_dataset(
+        X_train_t, y_train_t, best_index, best_name, N_CLIENTS
     )
-    X_curr, X_curr_test, y_curr, y_curr_test, _ = GetPreparedData(
-        train_data_curr, test_data_curr,
-        prep_type=prep_type, seed=seed, prep_name=prep_name,
-        mapping=shared_mapping,
-    )
-
-    old_feature_indices, new_feature_indices = resolve_feature_indices(
-        X_prev.columns, X_curr.columns
-    )
-
-    def tensorize(X_train, X_test, y_train, y_test):
-        return (
-            torch.tensor(X_train.values, dtype=torch.float32),
-            torch.tensor(X_test.values, dtype=torch.float32),
-            torch.tensor(y_train.values, dtype=torch.float32).view(-1, 1),
-            torch.tensor(y_test.values, dtype=torch.float32).view(-1, 1),
-        )
-
-    X_prev_t, X_prev_test_t, y_prev_t, y_prev_test_t = tensorize(
-        X_prev, X_prev_test, y_prev, y_prev_test
-    )
-    X_curr_t, X_curr_test_t, y_curr_t, y_curr_test_t = tensorize(
-        X_curr, X_curr_test, y_curr, y_curr_test
-    )
-
-    def partition(X_train, y_train):
-        best_index, best_name = resolve_best_feature(X_train.columns)
-        return partition_dataset(
-            torch.tensor(X_train.values, dtype=torch.float32),
-            torch.tensor(y_train.values, dtype=torch.float32).view(-1, 1),
-            best_index, best_name, N_CLIENTS,
-        )
-
-    prev_clients = partition(X_prev, y_prev)
-    curr_clients = partition(X_curr, y_curr)
-
-    for prefix, clients in (("prev", prev_clients), ("curr", curr_clients)):
-        X_clients, y_clients = clients[0], clients[1]
-        for i in range(N_CLIENTS):
-            torch.save(X_clients[i], os.path.join(tensor_dir, f"{prefix}_client_{i+1}_X.pt"))
-            torch.save(y_clients[i], os.path.join(tensor_dir, f"{prefix}_client_{i+1}_y.pt"))
-
-    torch.save(X_prev_test_t, os.path.join(tensor_dir, "prev_test_X.pt"))
-    torch.save(y_prev_test_t, os.path.join(tensor_dir, "prev_test_y.pt"))
-    torch.save(X_curr_test_t, os.path.join(tensor_dir, "curr_test_X.pt"))
-    torch.save(y_curr_test_t, os.path.join(tensor_dir, "curr_test_y.pt"))
+    X_clients, y_clients = clients[0], clients[1]
+    for i in range(N_CLIENTS):
+        torch.save(X_clients[i], os.path.join(tensor_dir, f"client_{i+1}_X.pt"))
+        torch.save(y_clients[i], os.path.join(tensor_dir, f"client_{i+1}_y.pt"))
+    torch.save(X_test_t, os.path.join(tensor_dir, "test_X.pt"))
+    torch.save(y_test_t, os.path.join(tensor_dir, "test_y.pt"))
     torch.save({
-        "old_feature_indices": old_feature_indices,
-        "new_feature_indices": new_feature_indices,
+        "old_feature_indices": old_indices,
+        "new_feature_indices": new_indices,
+        "input_dim": X_train.shape[1],
     }, os.path.join(tensor_dir, "feature_indices.pt"))
-
-    print(f"[PREP] Old features: {X_prev.shape[1]} | current features: {X_curr.shape[1]}")
-    print(f"[PREP] Tensors saved → {tensor_dir}")
-    print(f"[PREP] Ready for: python {__file__} --mode multimachine "
-          f"--prep_type {prep_type} --rank <R> --master_addr <IP>")
+    print(f"[PREP] Expanded features: {X_train.shape[1]}")
+    print(f"[PREP] Tensors saved -> {tensor_dir}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  MULTIMACHINE  mode
 # ═══════════════════════════════════════════════════════════════════════════════
-### Unmodified for now
 def run_federated_multimachine(rank, world_size, prep_type, prep_name,
                                master_addr, master_port, base_dir):
-    """
-    Each physical VM runs this with its assigned rank.
-      rank 0  → Global server: aggregates, evaluates, saves current model.
-      rank 1-4 → FL clients: train old/current models locally, then participate
-                  in FedAvg for both models.
-    """
+    """Run the same P' = P + Delta P method across physical machines."""
     setup_multimachine(rank, world_size, master_addr, master_port)
     device = torch.device("cpu")
+    tensor_dir = os.path.join(base_dir, "Tensors", ALGO, prep_name)
+    results_dir = os.path.join(
+        base_dir, "Results", "feat-incr", "Company", ALGO,
+        prep_name, "Seed_0"
+    )
+    model_path = os.path.join(base_dir, MODEL_ROOT, prep_name)
+    log_file = os.path.join(results_dir, "training_log_mm.txt")
+    time_file = os.path.join(results_dir, "train_times_mm.csv")
 
-    tensor_dir  = os.path.join(base_dir, "Tensors", ALGO, prep_name)
-    results_dir = os.path.join(base_dir, "Results", "Company",
-                               ALGO, prep_name, "Seed_0")
-    model_path  = os.path.join(base_dir, "Model", ALGO, prep_name)
-    log_file    = os.path.join(results_dir, "training_log_mm.txt")
-    time_file   = os.path.join(results_dir, "train_times_mm.csv")
+    feature_indices = torch.load(
+        os.path.join(tensor_dir, "feature_indices.pt"), map_location="cpu"
+    )
+    old_feature_indices = feature_indices["old_feature_indices"]
+    checkpoint_path = os.path.join(
+        base_dir, "Model", "old", "PBP", prep_name,
+        "ArtificialNeuralNetwork_final.pth",
+    )
+    baseline_state = load_baseline_state(checkpoint_path)
 
     if rank == 0:
         os.makedirs(results_dir, exist_ok=True)
-        os.makedirs(model_path,  exist_ok=True)
+        os.makedirs(model_path, exist_ok=True)
         initialize_time_file(time_file)
-
-    feature_indices = torch.load(os.path.join(tensor_dir, "feature_indices.pt"))
-    old_feature_indices = feature_indices["old_feature_indices"]
-
-    if rank == 0:
-        X_prev_test = torch.load(os.path.join(tensor_dir, "prev_test_X.pt"))
-        y_prev_test = torch.load(os.path.join(tensor_dir, "prev_test_y.pt"))
-        X_curr_test = torch.load(os.path.join(tensor_dir, "curr_test_X.pt"))
-        y_curr_test = torch.load(os.path.join(tensor_dir, "curr_test_y.pt"))
-        prev_test_loader = DataLoader(
-            TensorDataset(X_prev_test, y_prev_test), batch_size=32, shuffle=False
+        X_test = torch.load(os.path.join(tensor_dir, "test_X.pt"), map_location="cpu")
+        y_test = torch.load(os.path.join(tensor_dir, "test_y.pt"), map_location="cpu")
+        test_loader = DataLoader(
+            TensorDataset(X_test, y_test), batch_size=32, shuffle=False
         )
-        curr_test_loader = DataLoader(
-            TensorDataset(X_curr_test, y_curr_test), batch_size=32, shuffle=False
-        )
-        n_test = len(X_curr_test)
-        prev_input_dim = X_prev_test.shape[1]
-        curr_input_dim = X_curr_test.shape[1]
-        print(f"[Server rank=0] Old/current features: "
-              f"{prev_input_dim}/{curr_input_dim} | test={n_test}")
+        input_dim = X_test.shape[1]
+        n_test = len(X_test)
+        print(f"[Server rank=0] Expanded features: {input_dim} | test={n_test}")
     else:
-        X_prev_client = torch.load(
-            os.path.join(tensor_dir, f"prev_client_{rank}_X.pt")
+        X_client = torch.load(
+            os.path.join(tensor_dir, f"client_{rank}_X.pt"), map_location="cpu"
         )
-        y_prev_client = torch.load(
-            os.path.join(tensor_dir, f"prev_client_{rank}_y.pt")
+        y_client = torch.load(
+            os.path.join(tensor_dir, f"client_{rank}_y.pt"), map_location="cpu"
         )
-        X_curr_client = torch.load(
-            os.path.join(tensor_dir, f"curr_client_{rank}_X.pt")
-        )
-        y_curr_client = torch.load(
-            os.path.join(tensor_dir, f"curr_client_{rank}_y.pt")
-        )
-        prev_loader = DataLoader(
-            TensorDataset(
-                X_prev_client, y_prev_client,
-                torch.arange(len(X_prev_client)),
-            ),
+        client_loader = DataLoader(
+            TensorDataset(X_client, y_client, torch.arange(len(X_client))),
             batch_size=32, shuffle=True,
         )
-        curr_loader = DataLoader(
-            TensorDataset(
-                X_curr_client, y_curr_client,
-                torch.arange(len(X_curr_client)),
-            ),
-            batch_size=32, shuffle=True,
-        )
-        prev_input_dim = X_prev_client.shape[1]
-        curr_input_dim = X_curr_client.shape[1]
-        print(f"[Client rank={rank}] Old/current records: "
-              f"{len(X_prev_client)}/{len(X_curr_client)}")
+        input_dim = X_client.shape[1]
+        print(f"[Client rank={rank}] Expanded records: {len(X_client)}")
 
-    prev_model = ArtificialNeuralNetwork(prev_input_dim).to(device)
-    curr_model = ArtificialNeuralNetwork(curr_input_dim).to(device)
-    with torch.no_grad():
-        curr_model.fc1.weight[:, old_feature_indices].copy_(prev_model.fc1.weight)
-        curr_model.fc1.bias.copy_(prev_model.fc1.bias)
-        curr_model.fc2.weight.copy_(prev_model.fc2.weight)
-        curr_model.fc2.bias.copy_(prev_model.fc2.bias)
-
-    fed_rounds  = 50
-    start       = time.time()
+    old_input_dim = baseline_state["fc1.weight"].shape[1]
+    baseline_model = ArtificialNeuralNetwork(old_input_dim).to(device)
+    baseline_model.load_state_dict(baseline_state)
+    for parameter in baseline_model.parameters():
+        parameter.requires_grad = False
+    current_model = ArtificialNeuralNetwork(
+        input_dim, baseline_state, old_feature_indices
+    ).to(device)
+    optimizer = optim.Adam(
+        current_model.parameters(), lr=current_model.learning_rate
+    )
+    fed_rounds = 50
+    start = time.time()
     total_inf_t = []
     acc = prec = rec = f1 = 0.0
 
-    for r in range(fed_rounds):
+    for round_number in range(fed_rounds):
         if rank == 0:
-            print(f"[Server] ── Aggregation round {r+1}/{fed_rounds} ──")
+            print(f"[MM] Round {round_number + 1}/{fed_rounds}")
         else:
-            print(f"[Client {rank}] Training round {r+1}/{fed_rounds}")
-
-        if rank != 0:
             train_local(
-                rank, prev_model, prev_loader, curr_model, curr_loader, device,
-                old_feature_indices,
+                rank, baseline_model, current_model, client_loader, device,
+                old_feature_indices, optimizer
             )
 
-        aggregate_multimachine(
-            rank, prev_model, curr_model, n_clients=N_CLIENTS
-        )
-        end = time.time()
+        aggregate_multimachine(rank, current_model, n_clients=N_CLIENTS)
 
         if rank == 0:
-            acc, prec, rec, f1, inf_t = evaluate(curr_model, curr_test_loader, device)
+            acc, prec, rec, f1, inf_t = evaluate(
+                current_model, test_loader, device
+            )
             total_inf_t.extend(inf_t)
-            save_round_result(curr_model.__class__.__name__,
-                              acc, prec, rec, f1, results_dir)
-            with open(log_file, "a") as lf:
-                lf.write(f"Round {r+1}  AvgInference={np.mean(inf_t):.10f}s\n")
+            save_round_result(
+                "ArtificialNeuralNetwork", acc, prec, rec, f1, results_dir
+            )
+            with open(log_file, "a") as log:
+                log.write(
+                    f"Round {round_number + 1}  "
+                    f"AvgInference={np.mean(inf_t):.10f}s\n"
+                )
 
-    total_train_time = end - start
-    save_training_time(curr_model.__class__.__name__, rank, total_train_time, time_file)
-
+    total_train_time = time.time() - start
+    save_training_time("ArtificialNeuralNetwork", rank, total_train_time, time_file)
     if rank == 0:
         save_path = os.path.join(
-            model_path, f"{curr_model.__class__.__name__}_feat_incr_final.pth"
+            model_path, "ArtificialNeuralNetwork_feat_incr_final.pth"
         )
-        torch.save(curr_model.state_dict(), save_path)
-        print(f"[Server] Model saved → {save_path}")
-
+        torch.save(current_model.merged_state_dict(), save_path)
+        print(f"[Server] Model saved -> {save_path}")
         avg_inf_ms = np.mean(total_inf_t) * 1000 if total_inf_t else 0.0
         save_consolidated_result(
-            base_dir, ALGO, prep_name, curr_model.__class__.__name__,
-            acc, prec, rec, f1,
-            total_train_time, avg_inf_ms,
+            base_dir, ALGO, prep_name, "ArtificialNeuralNetwork",
+            acc, prec, rec, f1, total_train_time, avg_inf_ms,
             -1, int(n_test),
         )
-
     cleanup()
 
 
@@ -1280,7 +1229,7 @@ if __name__ == "__main__":
         help=(
             "multithread  : simulate 4 clients + server on one machine (default)\n"
             "prep         : prepare & save tensors/CSVs for multimachine mode\n"
-            "multimachine : real distributed — one process per VM\n"
+            "multimachine : real distributed - one process per VM\n"
         ),
     )
     parser.add_argument(
