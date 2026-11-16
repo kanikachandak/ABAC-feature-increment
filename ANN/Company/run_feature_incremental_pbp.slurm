@@ -7,8 +7,6 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=16G
 #SBATCH --time=72:00:00
-#SBATCH --mail-user=f20231101@hyderabad.bits-pilani.ac.in
-#SBATCH --mail-type=BEGIN,END,FAIL
 
 set -euo pipefail
 
